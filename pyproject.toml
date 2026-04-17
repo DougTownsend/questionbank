@@ -1,0 +1,29 @@
+[project]
+name = "question-bank"
+version = "0.1.0"
+description = "Local Moodle question-bank curation app"
+requires-python = ">=3.10"
+dependencies = [
+    "nicegui>=2.0",
+    "lxml>=5.0",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+question-bank = "question_bank.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

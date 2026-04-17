@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<quiz>
+  <question type="category">
+    <category><text>$course$/ECE212/Chapter 3/Caches</text></category>
+    <info format="html"><text></text></info>
+    <idnumber></idnumber>
+  </question>
+
+  <question type="multichoice">
+    <name><text>Cache hit rate definition</text></name>
+    <questiontext format="html">
+      <text><![CDATA[<p>Which expression best defines the cache <b>hit rate</b>?</p>]]></text>
+    </questiontext>
+    <generalfeedback format="html">
+      <text><![CDATA[<p>Hit rate = hits / total accesses.</p>]]></text>
+    </generalfeedback>
+    <defaultgrade>1.0</defaultgrade>
+    <penalty>0.3333333</penalty>
+    <hidden>0</hidden>
+    <single>true</single>
+    <shuffleanswers>true</shuffleanswers>
+    <answernumbering>abc</answernumbering>
+    <answer fraction="100" format="html">
+      <text><![CDATA[hits / (hits + misses)]]></text>
+      <feedback format="html"><text>Correct! This is the hit rate.</text></feedback>
+    </answer>
+    <answer fraction="0" format="html">
+      <text><![CDATA[misses / (hits + misses)]]></text>
+      <feedback format="html"><text>That's the miss rate, not the hit rate.</text></feedback>
+    </answer>
+    <answer fraction="0" format="html">
+      <text><![CDATA[hits / misses]]></text>
+      <feedback format="html"><text>This ratio can exceed 1, so it can't be a rate.</text></feedback>
+    </answer>
+    <answer fraction="0" format="html">
+      <text><![CDATA[misses / hits]]></text>
+      <feedback format="html"><text>Inverted.</text></feedback>
+    </answer>
+  </question>
+
+  <question type="truefalse">
+    <name><text>Write-through always writes to main memory</text></name>
+    <questiontext format="html">
+      <text><![CDATA[<p>In a write-through cache policy, every write updates both the cache and main memory.</p>]]></text>
+    </questiontext>
+    <generalfeedback format="html">
+      <text></text>
+    </generalfeedback>
+    <defaultgrade>1.0</defaultgrade>
+    <penalty>1</penalty>
+    <hidden>0</hidden>
+    <answer fraction="100" format="moodle_auto_format">
+      <text>true</text>
+      <feedback format="html"><text>Correct — that is the definition of write-through.</text></feedback>
+    </answer>
+    <answer fraction="0" format="moodle_auto_format">
+      <text>false</text>
+      <feedback format="html"><text>Incorrect — write-through updates main memory on every write.</text></feedback>
+    </answer>
+  </question>
+
+  <question type="numerical">
+    <name><text>Block offset bits</text></name>
+    <questiontext format="html">
+      <text><![CDATA[<p>A cache has 64-byte blocks. How many bits are used for the block offset?</p>]]></text>
+    </questiontext>
+    <generalfeedback format="html">
+      <text><![CDATA[<p>log2(64) = 6.</p>]]></text>
+    </generalfeedback>
+    <defaultgrade>1.0</defaultgrade>
+    <penalty>0.3333333</penalty>
+    <hidden>0</hidden>
+    <answer fraction="100" format="moodle_auto_format">
+      <text>6</text>
+      <tolerance>0</tolerance>
+      <feedback format="html"><text>Correct!</text></feedback>
+    </answer>
+    <unitgradingtype>0</unitgradingtype>
+    <unitpenalty>0.1000000</unitpenalty>
+    <showunits>3</showunits>
+    <unitsleft>0</unitsleft>
+  </question>
+
+  <question type="essay">
+    <name><text>Explain cache coherence</text></name>
+    <questiontext format="html">
+      <text><![CDATA[<p>Explain cache coherence in 3 sentences.</p>]]></text>
+    </questiontext>
+    <defaultgrade>5.0</defaultgrade>
+    <penalty>0</penalty>
+    <hidden>0</hidden>
+  </question>
+</quiz>

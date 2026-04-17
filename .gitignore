@@ -1,0 +1,32 @@
+# virtualenv
+.venv/
+venv/
+
+# python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# editable-install metadata
+*.egg-info/
+*.egg
+build/
+dist/
+
+# test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# editor & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# accidental local data if QUESTION_BANK_ROOT is ever pointed here
+/question_bank/

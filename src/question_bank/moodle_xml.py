@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from pathlib import Path
+
+from lxml import etree
+
+SUPPORTED_TYPES = {"multichoice", "truefalse", "numerical"}
+
+
+@dataclass
+class ParsedAnswer:
+    text_html: str
+    fraction: float
+    feedback_html: str | None = None
+    tolerance: float | None = None
+
+
+@dataclass
+class ParsedQuestion:
+    moodle_type: str
+    name: str | None
+    stem_html: str
+    raw_xml: str
+    raw_category: str | None
+    default_grade: float | None
+    penalty: float | None
+    general_feedback_html: str | None
+    answers: list[ParsedAnswer] = field(default_factory=list)
+
+    @property
+    def stem_hash(self) -> str:
+        return stem_hash_for(self.stem_html)
+
+
+@dataclass
+class ParseResult:
+    questions: list[ParsedQuestion]
+    unsupported: list[tuple[str, str]]  # (type, name)
+
+
+class ParseError(Exception):
+    pass
+
+
+def parse_file(path: Path | str) -> ParseResult:
+    with open(path, "rb") as f:
+        return parse_bytes(f.read())
+
+
+def parse_bytes(data: bytes) -> ParseResult:
+    try:
+        root = etree.fromstring(data)
+    except etree.XMLSyntaxError as e:
+        raise ParseError(f"invalid XML: {e}") from e
+    if root.tag != "quiz":
+        raise ParseError(f"expected root <quiz>, got <{root.tag}>")
+
+    questions: list[ParsedQuestion] = []
+    unsupported: list[tuple[str, str]] = []
+    current_category: str | None = None
+
+    for q in root.findall("question"):
+        qtype = q.get("type") or ""
+        if qtype == "category":
+            current_category = _text(q.find("category/text"))
+            continue
+        name = _text(q.find("name/text"))
+        if qtype not in SUPPORTED_TYPES:
+            unsupported.append((qtype, name or ""))
+            continue
+        parsed = _parse_question(q, qtype, current_category)
+        questions.append(parsed)
+
+    return ParseResult(questions=questions, unsupported=unsupported)
+
+
+def _parse_question(
+    q: etree._Element, qtype: str, category: str | None
+) -> ParsedQuestion:
+    name = _text(q.find("name/text"))
+    stem_html = _text(q.find("questiontext/text")) or ""
+    general_feedback_html = _text(q.find("generalfeedback/text"))
+    default_grade = _float(q.find("defaultgrade"))
+    penalty = _float(q.find("penalty"))
+
+    answers: list[ParsedAnswer] = []
+    for a in q.findall("answer"):
+        text_html = _text(a.find("text")) or ""
+        fraction = float(a.get("fraction") or "0")
+        feedback_html = _text(a.find("feedback/text"))
+        tolerance = _float(a.find("tolerance"))
+        answers.append(
+            ParsedAnswer(
+                text_html=text_html,
+                fraction=fraction,
+                feedback_html=feedback_html,
+                tolerance=tolerance,
+            )
+        )
+
+    raw_xml = etree.tostring(q, encoding="unicode")
+
+    return ParsedQuestion(
+        moodle_type=qtype,
+        name=name,
+        stem_html=stem_html,
+        raw_xml=raw_xml,
+        raw_category=category,
+        default_grade=default_grade,
+        penalty=penalty,
+        general_feedback_html=general_feedback_html,
+        answers=answers,
+    )
+
+
+def _text(el: etree._Element | None) -> str | None:
+    if el is None:
+        return None
+    return el.text
+
+
+def _float(el: etree._Element | None) -> float | None:
+    if el is None or el.text is None or el.text.strip() == "":
+        return None
+    try:
+        return float(el.text)
+    except ValueError:
+        return None
+
+
+# ---------- stem hashing (for dedup) ----------
+
+
+class _TextStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chunks: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.chunks.append(data)
+
+
+def _strip_html(html: str) -> str:
+    s = _TextStripper()
+    s.feed(html)
+    return "".join(s.chunks)
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_stem(stem_html: str) -> str:
+    text = _strip_html(stem_html)
+    text = text.replace("\u00a0", " ")
+    text = _WS_RE.sub(" ", text).strip().lower()
+    return text
+
+
+def stem_hash_for(stem_html: str) -> str:
+    return hashlib.sha256(normalize_stem(stem_html).encode("utf-8")).hexdigest()
+
+
+# Moodle context-token prefix used in <category> (e.g. $course$, $module$, $system$).
+# They're meaningful on import but noise for users browsing the bank.
+_CONTEXT_PREFIX_RE = re.compile(r"^\$[A-Za-z_]+\$/+")
+
+
+def format_category_for_display(raw: str | None) -> str:
+    if not raw:
+        return ""
+    return _CONTEXT_PREFIX_RE.sub("", raw).strip("/")
