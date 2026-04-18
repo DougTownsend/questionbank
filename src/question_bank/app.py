@@ -3,10 +3,11 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 from typing import Iterator
+from urllib.parse import quote_plus
 
 from nicegui import app, ui
 
-from . import context, db, exporter, importer, paths, preview
+from . import context, db, exporter, importer, moodle_xml, paths, preview
 from .moodle_xml import format_category_for_display
 
 
@@ -173,11 +174,30 @@ def import_page(class_name: str) -> None:
         ui.label(f"Import XML — {class_name}").classes("text-xl font-bold")
 
     ui.label(
-        "Upload a Moodle XML file. Supported question types: multichoice, truefalse, numerical. "
+        "Supported question types: multichoice, truefalse, numerical. "
         "Duplicates (same normalized stem text) are skipped."
     ).classes("text-sm text-gray-600 mt-2")
 
     report_area = ui.column().classes("w-full mt-4")
+    file_list_area = ui.column().classes("w-full mt-2")
+
+    def import_existing(path) -> None:
+        try:
+            with open_db(class_name) as conn:
+                report = importer.import_file(conn, path)
+        except Exception as exc:
+            ui.notify(f"Import failed: {exc}", type="negative")
+            return
+        _render_import_report(report_area, class_name, report)
+        _render_imports_dir(file_list_area, class_name, import_existing)
+
+    _render_imports_dir(file_list_area, class_name, import_existing)
+
+    ui.separator().classes("my-4")
+
+    ui.label("Or upload a file from elsewhere:").classes(
+        "text-sm text-gray-600 mt-2"
+    )
 
     async def handle_upload(e) -> None:
         data: bytes = await e.file.read()
@@ -188,6 +208,7 @@ def import_page(class_name: str) -> None:
             ui.notify(f"Import failed: {exc}", type="negative")
             return
         _render_import_report(report_area, class_name, report)
+        _render_imports_dir(file_list_area, class_name, import_existing)
 
     ui.upload(
         label="Drop Moodle XML here",
@@ -195,6 +216,52 @@ def import_page(class_name: str) -> None:
         multiple=False,
         auto_upload=True,
     ).props('accept=".xml"').classes("w-full")
+
+
+def _render_imports_dir(container, class_name: str, on_import) -> None:
+    container.clear()
+    imports_dir = paths.class_imports_dir(class_name)
+    files = sorted(
+        (p for p in imports_dir.glob("*.xml") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    with container:
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label(f"Files in imports/  ({len(files)})").classes(
+                "text-lg font-semibold"
+            )
+            ui.button(
+                "Refresh",
+                on_click=lambda: _render_imports_dir(container, class_name, on_import),
+            ).props("flat dense")
+        ui.label(f"~/question_bank/classes/{class_name}/imports/").classes(
+            "text-xs text-gray-500 font-mono"
+        )
+        if not files:
+            ui.label(
+                "No XML files in imports/ yet. When Claude writes one here, "
+                "refresh to see it."
+            ).classes("text-gray-500 italic mt-1")
+            return
+        from datetime import datetime
+
+        for p in files:
+            size_kb = p.stat().st_size / 1024
+            mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            with ui.card().classes("w-full"):
+                with ui.row().classes("w-full items-center no-wrap gap-3"):
+                    ui.button(
+                        "Import",
+                        on_click=lambda _, path=p: on_import(path),
+                    ).props("color=primary")
+                    with ui.column().classes("gap-0 flex-grow"):
+                        ui.label(p.name).classes("font-semibold")
+                        ui.label(f"{size_kb:.1f} KB · modified {mtime}").classes(
+                            "text-xs text-gray-500"
+                        )
 
 
 def _render_import_report(container: ui.column, class_name: str, report) -> None:
@@ -300,13 +367,85 @@ def _render_next_pending(container: ui.column, class_name: str) -> None:
             _after_status_change()
             _render_next_pending(container, class_name)
 
-        def skip() -> None:
-            ui.notify("Skip not implemented yet — question stays pending")
+        def discard() -> None:
+            source_import_id = q["source_import_id"]
+            with open_db(class_name) as conn:
+                db.delete_question(conn, q["id"])
+                deleted = importer.cleanup_completed_import(
+                    conn, class_name, source_import_id
+                )
+            ui.notify("Discarded", type="info")
+            if deleted:
+                ui.notify(
+                    f"Removed source file: imports/{deleted.name}", type="info"
+                )
+            _render_next_pending(container, class_name)
 
-        with ui.row().classes("gap-2 mt-3"):
+        def edit() -> None:
+            return_to = quote_plus(f"/class/{class_name}/review")
+            ui.navigate.to(
+                f"/class/{class_name}/questions/{q['id']}/edit?return_to={return_to}"
+            )
+
+        def discard_all() -> None:
+            with open_db(class_name) as conn:
+                pending_list = db.list_questions(conn, status="pending")
+            n = len(pending_list)
+            if n == 0:
+                return
+
+            with ui.dialog() as dialog, ui.card():
+                ui.label(f"Discard all {n} pending question(s)?").classes(
+                    "text-lg font-semibold"
+                )
+                ui.label(
+                    "They will be deleted entirely — not moved to the rejected "
+                    "bank. This cannot be undone."
+                ).classes("text-sm text-gray-700")
+                with ui.row():
+                    ui.button("Cancel", on_click=dialog.close).props("flat")
+
+                    def do_discard_all() -> None:
+                        deleted_files: list = []
+                        with open_db(class_name) as conn:
+                            current = db.list_questions(conn, status="pending")
+                            source_imports = {
+                                q["source_import_id"]
+                                for q in current
+                                if q["source_import_id"] is not None
+                            }
+                            for q in current:
+                                db.delete_question(conn, q["id"])
+                            for iid in source_imports:
+                                d = importer.cleanup_completed_import(
+                                    conn, class_name, iid
+                                )
+                                if d:
+                                    deleted_files.append(d)
+                        dialog.close()
+                        ui.notify(
+                            f"Discarded {len(current)} question(s)", type="warning"
+                        )
+                        for d in deleted_files:
+                            ui.notify(
+                                f"Removed source file: imports/{d.name}",
+                                type="info",
+                            )
+                        _render_next_pending(container, class_name)
+
+                    ui.button(
+                        f"Discard all {n}", on_click=do_discard_all
+                    ).props("color=negative")
+            dialog.open()
+
+        with ui.row().classes("gap-2 mt-3 flex-wrap"):
             ui.button("Approve (A)", on_click=approve).props("color=positive")
             ui.button("Reject (R)", on_click=reject).props("color=negative")
-            ui.button("Skip", on_click=skip).props("flat")
+            ui.button("Edit (E)", on_click=edit).props("flat")
+            ui.button("Discard", on_click=discard).props("color=negative flat")
+            ui.button(
+                f"Discard all ({remaining})", on_click=discard_all
+            ).props("color=negative flat")
 
         # keyboard shortcuts
         def on_key(e) -> None:
@@ -316,6 +455,8 @@ def _render_next_pending(container: ui.column, class_name: str) -> None:
                     approve()
                 elif key == "r":
                     reject()
+                elif key == "e":
+                    edit()
 
         ui.keyboard(on_key=on_key)
 
@@ -343,38 +484,390 @@ def bank_page(class_name: str, status: str) -> None:
 
     with open_db(class_name) as conn:
         rows = db.list_questions(conn, status=status)
-        data = []
+        items: list[dict] = []
         for r in rows:
+            answers = db.get_answers(conn, r["id"])
+            rendered = preview.render_question(r, answers)
             note = (
                 db.latest_rejection_note(conn, r["id"])
                 if status == "rejected"
                 else None
             )
-            data.append(
+            cat = format_category_for_display(r["raw_category"])
+            header_parts = [f"[{r['moodle_type']}] {r['name'] or '(unnamed)'}"]
+            if cat:
+                header_parts.append(cat)
+            items.append(
                 {
                     "id": r["id"],
-                    "type": r["moodle_type"],
-                    "name": r["name"] or "",
-                    "category": format_category_for_display(r["raw_category"]),
-                    "note": note or "",
+                    "header": "  ·  ".join(header_parts),
+                    "note": note,
+                    "rendered": rendered,
                 }
             )
 
-    if not data:
+    if not items:
         ui.label(f"No {status} questions yet.").classes("text-gray-500 italic mt-3")
         return
 
-    columns = [
-        {"name": "id", "label": "ID", "field": "id", "align": "left"},
-        {"name": "type", "label": "Type", "field": "type", "align": "left"},
-        {"name": "name", "label": "Name", "field": "name", "align": "left"},
-        {"name": "category", "label": "Category", "field": "category", "align": "left"},
-    ]
-    if status == "rejected":
-        columns.append(
-            {"name": "note", "label": "Rejection note", "field": "note", "align": "left"}
+    ui.label(
+        f"{len(items)} {status} question(s). Click any row to expand."
+    ).classes("text-sm text-gray-600 mt-3")
+
+    selection: dict[int, "ui.checkbox"] = {}
+
+    def selected_ids() -> list[int]:
+        return [qid for qid, cb in selection.items() if cb.value]
+
+    def refresh_toolbar() -> None:
+        n = len(selected_ids())
+        remove_selected_btn.text = f"Remove selected ({n})"
+        remove_selected_btn.set_enabled(n > 0)
+
+    def select_all() -> None:
+        for cb in selection.values():
+            cb.value = True
+        refresh_toolbar()
+
+    def clear_selection() -> None:
+        for cb in selection.values():
+            cb.value = False
+        refresh_toolbar()
+
+    def remove_selected() -> None:
+        ids = selected_ids()
+        if not ids:
+            return
+        _confirm_remove_questions(class_name, ids, status)
+
+    with ui.row().classes("gap-2 items-center mt-2"):
+        remove_selected_btn = ui.button(
+            "Remove selected (0)", on_click=remove_selected
+        ).props("color=negative flat")
+        remove_selected_btn.set_enabled(False)
+        ui.button("Select all", on_click=select_all).props("flat")
+        ui.button("Clear", on_click=clear_selection).props("flat")
+
+    for it in items:
+        caption = (
+            (it["note"][:120] + "…")
+            if it["note"] and len(it["note"]) > 120
+            else it["note"]
         )
-    ui.table(columns=columns, rows=data, row_key="id").classes("w-full mt-3")
+        with ui.row().classes("w-full items-start no-wrap gap-2"):
+            cb = ui.checkbox(on_change=lambda _: refresh_toolbar()).classes("mt-2")
+            selection[it["id"]] = cb
+            ui.button(
+                "Remove",
+                on_click=lambda _, qid=it["id"]: _confirm_remove_question(
+                    class_name, qid, status
+                ),
+            ).props("color=negative flat dense").classes("mt-2")
+            with ui.expansion(it["header"], caption=caption).classes(
+                "flex-grow"
+            ).props("header-class=bg-gray-50"):
+                if it["note"]:
+                    with ui.card().classes(
+                        "w-full bg-red-50 border-l-4 border-red-400 mb-2"
+                    ):
+                        ui.label("Rejection note").classes(
+                            "font-bold text-red-700 text-sm"
+                        )
+                        ui.label(it["note"]).classes(
+                            "text-red-900 whitespace-pre-wrap"
+                        )
+                ui.html(it["rendered"])
+                if status == "approved":
+                    with ui.row().classes("gap-2 mt-3"):
+                        ui.button(
+                            "Edit",
+                            on_click=lambda _, qid=it["id"]: ui.navigate.to(
+                                f"/class/{class_name}/questions/{qid}/edit"
+                                f"?return_to={quote_plus(f'/class/{class_name}/bank/approved')}"
+                            ),
+                        ).props("flat")
+
+
+# ---------- shared: remove question + edit page ----------
+
+
+def _confirm_remove_questions(
+    class_name: str, qids: list[int], status: str
+) -> None:
+    with open_db(class_name) as conn:
+        affected_assignments: dict[str, int] = {}
+        for qid in qids:
+            for a in db.assignments_containing_question(conn, qid):
+                affected_assignments[a["name"]] = affected_assignments.get(
+                    a["name"], 0
+                ) + 1
+
+    with ui.dialog() as dialog, ui.card():
+        ui.label(f"Delete {len(qids)} question(s) from the bank?").classes(
+            "text-lg font-semibold"
+        )
+        ui.label("This cannot be undone.").classes("text-sm text-gray-700")
+        if affected_assignments:
+            with ui.card().classes("w-full bg-yellow-50 border-l-4 border-yellow-400"):
+                ui.label("Selected questions are used in these assignments:").classes(
+                    "font-bold text-yellow-800 text-sm"
+                )
+                for aname, n in sorted(affected_assignments.items()):
+                    ui.label(f"• {aname} ({n} question{'s' if n > 1 else ''})").classes(
+                        "text-yellow-900 text-sm"
+                    )
+                ui.label(
+                    "They will be removed from those assignments too."
+                ).classes("text-yellow-800 text-xs")
+        with ui.row():
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+
+            def do_remove() -> None:
+                with open_db(class_name) as conn:
+                    for qid in qids:
+                        db.delete_question(conn, qid)
+                dialog.close()
+                ui.notify(f"Removed {len(qids)} question(s)", type="warning")
+                ui.navigate.to(f"/class/{class_name}/bank/{status}")
+
+            ui.button(f"Delete {len(qids)}", on_click=do_remove).props(
+                "color=negative"
+            )
+    dialog.open()
+
+
+def _confirm_remove_question(class_name: str, qid: int, status: str) -> None:
+    with open_db(class_name) as conn:
+        in_assignments = db.assignments_containing_question(conn, qid)
+
+    with ui.dialog() as dialog, ui.card():
+        ui.label("Delete this question from the bank?").classes("text-lg font-semibold")
+        ui.label(
+            "The question will be removed completely. This cannot be undone."
+        ).classes("text-sm text-gray-700")
+        if in_assignments:
+            names = ", ".join(a["name"] for a in in_assignments)
+            with ui.card().classes("w-full bg-yellow-50 border-l-4 border-yellow-400"):
+                ui.label("Also in these assignments:").classes(
+                    "font-bold text-yellow-800 text-sm"
+                )
+                ui.label(names).classes("text-yellow-900 text-sm")
+                ui.label(
+                    "The question will be removed from those assignments too."
+                ).classes("text-yellow-800 text-xs")
+        with ui.row():
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+
+            def do_remove() -> None:
+                with open_db(class_name) as conn:
+                    db.delete_question(conn, qid)
+                dialog.close()
+                ui.notify("Removed from bank", type="warning")
+                ui.navigate.to(f"/class/{class_name}/bank/{status}")
+
+            ui.button("Delete", on_click=do_remove).props("color=negative")
+    dialog.open()
+
+
+@ui.page("/class/{class_name}/questions/{question_id}/edit")
+def edit_question_page(
+    class_name: str, question_id: str, return_to: str = ""
+) -> None:
+    _inject_css()
+    if class_name not in paths.list_classes():
+        ui.label(f"Class '{class_name}' not found").classes("text-red-600")
+        return
+    try:
+        qid = int(question_id)
+    except ValueError:
+        ui.label("Invalid question id").classes("text-red-600")
+        return
+
+    back_url = return_to or f"/class/{class_name}"
+
+    with open_db(class_name) as conn:
+        q = db.get_question(conn, qid)
+        if q is None:
+            ui.label(f"Question {qid} not found").classes("text-red-600")
+            return
+        answers_rows = db.get_answers(conn, qid)
+
+    qtype = q["moodle_type"]
+    state: dict = {
+        "name": q["name"] or "",
+        "stem_html": q["stem_html"] or "",
+        "raw_category": q["raw_category"] or "",
+        "general_feedback_html": q["general_feedback_html"] or "",
+        "answers": [
+            {
+                "text_html": a["text_html"] or "",
+                "fraction": float(a["fraction"]),
+                "feedback_html": a["feedback_html"] or "",
+                "tolerance": a["tolerance"],
+            }
+            for a in answers_rows
+        ],
+    }
+
+    with ui.row().classes("items-center gap-4"):
+        ui.button("← Cancel", on_click=lambda: ui.navigate.to(back_url)).props("flat")
+        ui.label(f"Edit question · type={qtype}").classes("text-xl font-bold")
+
+    with ui.column().classes("w-full max-w-3xl gap-3 mt-3"):
+        name_input = ui.input(label="Name", value=state["name"]).classes("w-full")
+        cat_input = ui.input(
+            label="Category (e.g. $course$/ECE212/Caches)",
+            value=state["raw_category"],
+        ).classes("w-full")
+        stem_input = (
+            ui.textarea(label="Question stem (HTML allowed)", value=state["stem_html"])
+            .classes("w-full")
+            .props("rows=5 autogrow")
+        )
+        gf_input = (
+            ui.textarea(
+                label="General feedback (HTML, shown after attempt)",
+                value=state["general_feedback_html"],
+            )
+            .classes("w-full")
+            .props("rows=3 autogrow")
+        )
+
+        ui.separator().classes("my-2")
+        ui.label("Answers").classes("text-lg font-semibold")
+
+        answers_col = ui.column().classes("w-full gap-3")
+        answer_rows: list[dict] = []
+
+        def collect_state() -> None:
+            state["name"] = name_input.value or ""
+            state["stem_html"] = stem_input.value or ""
+            state["raw_category"] = cat_input.value or ""
+            state["general_feedback_html"] = gf_input.value or ""
+            for i, row in enumerate(answer_rows):
+                if i >= len(state["answers"]):
+                    continue
+                state["answers"][i]["text_html"] = row["text"].value or ""
+                try:
+                    state["answers"][i]["fraction"] = float(row["fraction"].value or 0)
+                except (TypeError, ValueError):
+                    state["answers"][i]["fraction"] = 0.0
+                state["answers"][i]["feedback_html"] = row["feedback"].value or ""
+                if "tolerance" in row:
+                    val = row["tolerance"].value
+                    try:
+                        state["answers"][i]["tolerance"] = (
+                            float(val) if val is not None and val != "" else None
+                        )
+                    except (TypeError, ValueError):
+                        state["answers"][i]["tolerance"] = None
+
+        def render_answers() -> None:
+            answers_col.clear()
+            answer_rows.clear()
+            with answers_col:
+                for i, a in enumerate(state["answers"]):
+                    with ui.card().classes("w-full"):
+                        row: dict = {}
+                        with ui.row().classes("w-full items-end gap-2"):
+                            row["fraction"] = (
+                                ui.number(
+                                    label="Score % (100=correct, 0=wrong)",
+                                    value=a["fraction"],
+                                    step=1,
+                                )
+                                .classes("w-56")
+                            )
+                            if qtype == "numerical":
+                                row["tolerance"] = (
+                                    ui.number(
+                                        label="Tolerance ±",
+                                        value=a.get("tolerance"),
+                                        step=0.01,
+                                    )
+                                    .classes("w-40")
+                                )
+                            if qtype == "multichoice" and len(state["answers"]) > 1:
+                                def remove(_, idx=i) -> None:
+                                    collect_state()
+                                    state["answers"].pop(idx)
+                                    render_answers()
+
+                                ui.button("Remove", on_click=remove).props(
+                                    "color=negative flat dense"
+                                ).classes("ml-auto")
+                        row["text"] = (
+                            ui.textarea(
+                                label="Answer text (HTML allowed)",
+                                value=a["text_html"],
+                            )
+                            .classes("w-full")
+                            .props("rows=2 autogrow")
+                        )
+                        row["feedback"] = (
+                            ui.textarea(
+                                label="Feedback shown when this answer is chosen",
+                                value=a["feedback_html"],
+                            )
+                            .classes("w-full")
+                            .props("rows=2 autogrow")
+                        )
+                        answer_rows.append(row)
+
+                if qtype == "multichoice":
+                    def add_answer() -> None:
+                        collect_state()
+                        state["answers"].append(
+                            {
+                                "text_html": "",
+                                "fraction": 0.0,
+                                "feedback_html": "",
+                                "tolerance": None,
+                            }
+                        )
+                        render_answers()
+
+                    ui.button("+ Add answer", on_click=add_answer).props("flat")
+
+        render_answers()
+
+        def save() -> None:
+            collect_state()
+            if not state["stem_html"].strip():
+                ui.notify("Stem cannot be empty", type="negative")
+                return
+            if not state["answers"]:
+                ui.notify("At least one answer is required", type="negative")
+                return
+
+            raw_xml = moodle_xml.serialize_question(
+                moodle_type=qtype,
+                name=state["name"] or None,
+                stem_html=state["stem_html"],
+                general_feedback_html=state["general_feedback_html"] or None,
+                default_grade=q["default_grade"],
+                penalty=q["penalty"],
+                answers=state["answers"],
+            )
+            stem_hash = moodle_xml.stem_hash_for(state["stem_html"])
+            with open_db(class_name) as conn:
+                db.update_question(
+                    conn,
+                    qid,
+                    name=state["name"] or None,
+                    stem_html=state["stem_html"],
+                    stem_hash=stem_hash,
+                    raw_xml=raw_xml,
+                    raw_category=state["raw_category"] or None,
+                    general_feedback_html=state["general_feedback_html"] or None,
+                    answers=state["answers"],
+                )
+            ui.notify("Saved", type="positive")
+            ui.navigate.to(back_url)
+
+        with ui.row().classes("gap-2 mt-4"):
+            ui.button("Save", on_click=save).props("color=primary")
+            ui.button("Cancel", on_click=lambda: ui.navigate.to(back_url)).props("flat")
 
 
 # ---------- assignments: list ----------
@@ -637,7 +1130,13 @@ def _render_pool(
 
         for q in available:
             with ui.card().classes("w-full"):
-                with ui.row().classes("w-full items-center justify-between"):
+                with ui.row().classes("w-full items-center no-wrap gap-3"):
+                    ui.button(
+                        "Add",
+                        on_click=lambda _, qid=q["id"]: _add_to_assignment(
+                            class_name, aid, qid
+                        ),
+                    ).props("color=primary")
                     with ui.column().classes("gap-0 flex-grow"):
                         ui.label(
                             f"[{q['moodle_type']}] {q['name'] or '(unnamed)'}"
@@ -650,12 +1149,6 @@ def _render_pool(
                         ui.html(
                             f"<div style='font-size:0.8rem;color:#555;max-height:3em;overflow:hidden'>{q['stem_html'] or ''}</div>"
                         )
-                    ui.button(
-                        "Add",
-                        on_click=lambda _, qid=q["id"]: _add_to_assignment(
-                            class_name, aid, qid
-                        ),
-                    ).props("color=primary")
 
 
 def _add_to_assignment(class_name: str, aid: int, qid: int) -> None:
@@ -700,14 +1193,14 @@ def _confirm_delete_assignment(class_name: str, aid: int) -> None:
 # ---------- entry point ----------
 
 
-def _serve() -> None:
+def _serve(show_browser: bool = False) -> None:
     paths.data_root().mkdir(parents=True, exist_ok=True)
     paths.classes_root().mkdir(parents=True, exist_ok=True)
     ui.run(
         title="Question Bank",
         port=8765,
         reload=False,
-        show=True,
+        show=show_browser,
         storage_secret="question-bank-local",
     )
 
@@ -739,7 +1232,14 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(prog="question-bank")
     sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("serve", help="Run the web UI (default)")
+    p_serve = sub.add_parser("serve", help="Run the web UI (default)")
+    for p in (parser, p_serve):
+        p.add_argument(
+            "-b",
+            "--browser",
+            action="store_true",
+            help="auto-open the UI in your default browser on startup",
+        )
     sub.add_parser("list", help="List existing classes")
     ec = sub.add_parser(
         "export-context",
@@ -747,9 +1247,14 @@ def main() -> int:
     )
     ec.add_argument("class_name", help="Name of the class")
 
+    # Argparse clobbers the top-level flag when the subparser redefines it.
+    # Sniff argv directly so --browser works anywhere on the command line.
+    import sys as _sys
+    show_browser = any(a in ("-b", "--browser") for a in _sys.argv[1:])
+
     args = parser.parse_args()
     if args.cmd in (None, "serve"):
-        _serve()
+        _serve(show_browser=show_browser)
         return 0
     if args.cmd == "list":
         return _cmd_list_classes()

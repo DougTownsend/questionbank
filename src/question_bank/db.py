@@ -218,6 +218,70 @@ def set_status(
         )
 
 
+def delete_question(conn: sqlite3.Connection, question_id: int) -> None:
+    """Delete a question and everything that references it (answers, rejection
+    notes, assignment_questions via cascade)."""
+    conn.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+
+
+def update_question(
+    conn: sqlite3.Connection,
+    question_id: int,
+    *,
+    name: str | None,
+    stem_html: str,
+    stem_hash: str,
+    raw_xml: str,
+    raw_category: str | None,
+    general_feedback_html: str | None,
+    answers: list[dict],
+) -> None:
+    conn.execute(
+        """UPDATE questions SET
+           name = ?, stem_html = ?, stem_hash = ?, raw_xml = ?,
+           raw_category = ?, general_feedback_html = ?,
+           updated_at = datetime('now')
+           WHERE id = ?""",
+        (
+            name,
+            stem_html,
+            stem_hash,
+            raw_xml,
+            raw_category,
+            general_feedback_html,
+            question_id,
+        ),
+    )
+    conn.execute("DELETE FROM question_answers WHERE question_id = ?", (question_id,))
+    for i, a in enumerate(answers):
+        conn.execute(
+            """INSERT INTO question_answers
+               (question_id, ord, text_html, fraction, feedback_html, tolerance)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                question_id,
+                i,
+                a["text_html"],
+                a["fraction"],
+                a.get("feedback_html"),
+                a.get("tolerance"),
+            ),
+        )
+
+
+def assignments_containing_question(
+    conn: sqlite3.Connection, question_id: int
+) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """SELECT a.* FROM assignments a
+               JOIN assignment_questions aq ON aq.assignment_id = a.id
+               WHERE aq.question_id = ?""",
+            (question_id,),
+        )
+    )
+
+
 def latest_rejection_note(conn: sqlite3.Connection, question_id: int) -> str | None:
     row = conn.execute(
         """SELECT note_text FROM rejection_notes

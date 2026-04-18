@@ -31,7 +31,8 @@ python3 -m venv .venv
 .venv/bin/pytest -q
 
 # run the app
-.venv/bin/question-bank            # default: serve web UI
+.venv/bin/question-bank            # default: serve web UI (browser NOT auto-opened)
+.venv/bin/question-bank --browser  # serve + auto-open browser
 .venv/bin/question-bank list       # list class names
 .venv/bin/question-bank export-context <class>   # regenerate CLAUDE.md + BANK_CONTEXT.md
 
@@ -100,7 +101,10 @@ These are locked in and shouldn't be reversed without checking with the user:
   to learn from.
 - **Dedup is exact-match on normalized stem text** (lowercased, whitespace-
   collapsed, HTML stripped, SHA-256). Near-duplicate fuzzy matching is
-  deferred to v0.5.
+  deferred to v0.5. **When v0.5 lands, skip fuzzy compare entirely for
+  `type="numerical"`** — the professor often wants multiple numerical
+  variants that differ only by digits, and fuzzy would over-flag them.
+  Exact-match remains in effect for all types.
 - **Every question keeps its raw XML** (`questions.raw_xml`) so re-export
   is lossless even for types/attributes we don't fully model.
 - **Topic model is hybrid**: questions carry a Moodle `<category>` string
@@ -119,7 +123,8 @@ Upcoming:
   (Partially done in assignment detail page already.)
 - **v0.4**: built-in `Build Claude context bundle` UI button (currently only
   available via `question-bank export-context` CLI).
-- **v0.5**: near-duplicate detection via `rapidfuzz`; edit-in-place for
+- **v0.5**: near-duplicate detection via `rapidfuzz` (skipped for
+  `numerical` type — see key-decision note above); edit-in-place for
   approved questions + edit history.
 - **v0.6**: export/import a class as `.zip` for sharing between computers.
 - **later**: shortanswer/essay/cloze/matching types, MathJax + image

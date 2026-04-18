@@ -41,11 +41,11 @@ question-bank list
 ### 1. Start the app
 
 ```bash
-question-bank
+question-bank            # start the server (browser NOT opened automatically)
+question-bank --browser  # start the server and auto-open the UI in your default browser
 ```
 
-This opens `http://localhost:8765` in your default browser. Ctrl-C in the
-terminal to stop.
+The UI is at `http://localhost:8765`. Ctrl-C in the terminal to stop.
 
 ### 2. Create a class
 
@@ -114,6 +114,7 @@ Import the exported XML into Moodle via
 
 ```bash
 question-bank                           # start the web UI (default)
+question-bank --browser                 # start the web UI and auto-open your browser
 question-bank list                      # list class names on this machine
 question-bank export-context <class>    # regenerate CLAUDE.md + BANK_CONTEXT.md for a class
 ```

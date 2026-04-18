@@ -173,3 +173,65 @@ def format_category_for_display(raw: str | None) -> str:
     if not raw:
         return ""
     return _CONTEXT_PREFIX_RE.sub("", raw).strip("/")
+
+
+# ---------- serializer (round-trips parse -> DB -> serialize) ----------
+
+
+def serialize_question(
+    *,
+    moodle_type: str,
+    name: str | None,
+    stem_html: str,
+    general_feedback_html: str | None,
+    default_grade: float | None,
+    penalty: float | None,
+    answers: list[dict],
+) -> str:
+    """Build a `<question>` element fragment for the given fields.
+    Used to refresh `raw_xml` after an in-app edit, so later exports reflect
+    the current state."""
+    q = etree.Element("question", type=moodle_type)
+
+    name_el = etree.SubElement(q, "name")
+    etree.SubElement(name_el, "text").text = name or ""
+
+    qt = etree.SubElement(q, "questiontext", format="html")
+    etree.SubElement(qt, "text").text = etree.CDATA(stem_html or "")
+
+    gf = etree.SubElement(q, "generalfeedback", format="html")
+    etree.SubElement(gf, "text").text = etree.CDATA(general_feedback_html or "")
+
+    if default_grade is not None:
+        etree.SubElement(q, "defaultgrade").text = _fmt_num(default_grade)
+    if penalty is not None:
+        etree.SubElement(q, "penalty").text = _fmt_num(penalty)
+    etree.SubElement(q, "hidden").text = "0"
+
+    if moodle_type == "multichoice":
+        etree.SubElement(q, "single").text = "true"
+        etree.SubElement(q, "shuffleanswers").text = "true"
+        etree.SubElement(q, "answernumbering").text = "abc"
+
+    for a in answers:
+        answer_fmt = (
+            "html" if moodle_type == "multichoice" else "moodle_auto_format"
+        )
+        a_el = etree.SubElement(
+            q, "answer", fraction=_fmt_num(float(a["fraction"])), format=answer_fmt
+        )
+        etree.SubElement(a_el, "text").text = etree.CDATA(a["text_html"] or "")
+        if moodle_type == "numerical" and a.get("tolerance") is not None:
+            etree.SubElement(a_el, "tolerance").text = _fmt_num(float(a["tolerance"]))
+        fb_html = a.get("feedback_html") or ""
+        fb_el = etree.SubElement(a_el, "feedback", format="html")
+        etree.SubElement(fb_el, "text").text = etree.CDATA(fb_html)
+
+    return etree.tostring(q, encoding="unicode", pretty_print=True)
+
+
+def _fmt_num(x: float) -> str:
+    # integer-valued floats become "100" not "100.0"; otherwise keep the float
+    if x == int(x):
+        return str(int(x))
+    return f"{x:g}"

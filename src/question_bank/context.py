@@ -64,8 +64,18 @@ Only these three are imported; other types are silently dropped:
 - **Every answer needs per-answer feedback.** For multichoice distractors, the
   feedback should explain *why* the distractor is tempting-but-wrong, not just
   say "incorrect".
-- **Include `<generalfeedback>`** explaining the underlying concept — shown to
-  students after their attempt.
+- **Never reveal the correct answer inside a wrong option's feedback.** The
+  point of per-answer feedback on a distractor is to address the misconception
+  the student showed by picking it — not to hand them the answer. A student
+  who picks a wrong option should leave that feedback understanding what was
+  wrong with their reasoning, not what the right answer was. Save the full
+  explanation for `<generalfeedback>`.
+- **Put the full explanation of the correct answer in `<generalfeedback>`.**
+  That's the block that fires after the attempt regardless of the student's
+  choice, so every student sees it. Walk through the reasoning or derivation
+  there. Per-answer feedback on the *correct* option can be brief ("Correct —
+  this follows directly from X") since the real explanation already lives in
+  the general feedback.
 - **Use a `<category>` question at the top** of the file if you know the
   topic: e.g. `$course$/<ClassName>/<Chapter>/<Subtopic>`.
 - **Do not duplicate** anything in `BANK_CONTEXT.md`. The app flags
