@@ -65,14 +65,17 @@ are stripped. This creates:
 
 ```bash
 cd ~/question_bank/classes/<class>
-question-bank export-context <class>   # refreshes CLAUDE.md + BANK_CONTEXT.md
 claude                                 # launch Claude in this directory
 ```
 
-`CLAUDE.md` tells Claude the workflow, supported question types, and the
-exact Moodle XML format to produce. `BANK_CONTEXT.md` shows it every
-already-approved and already-rejected question (with your rejection notes)
-so it doesn't duplicate and learns from past mistakes.
+`CLAUDE.md` tells Claude the workflow, supported question types, the exact
+Moodle XML format to produce, **and the schema of `bank.sqlite` with example
+`sqlite3` queries**. Claude queries the database directly to see what's
+already approved or rejected (and your rejection notes), so there's only
+one source of truth.
+
+`CLAUDE.md` is regenerated automatically when you create a class and on
+every app startup, so the instructions stay in sync with the app version.
 
 Ask Claude something like:
 
@@ -116,8 +119,11 @@ Import the exported XML into Moodle via
 question-bank                           # start the web UI (default)
 question-bank --browser                 # start the web UI and auto-open your browser
 question-bank list                      # list class names on this machine
-question-bank export-context <class>    # regenerate CLAUDE.md + BANK_CONTEXT.md for a class
 ```
+
+`CLAUDE.md` is refreshed automatically on class creation and on every
+app startup. Claude reads current bank state straight from `bank.sqlite`,
+so no pre-rendered snapshot file needs to be kept up-to-date.
 
 The data root defaults to `~/question_bank/`. Override with
 `QUESTION_BANK_ROOT=/some/other/path question-bank`.
@@ -171,11 +177,10 @@ on the other. If you break this rule you risk corrupting `bank.sqlite`.
 ~/question_bank/                         # data root (sync this with Syncthing)
 └── classes/
     └── ECE_212/
-        ├── bank.sqlite                  # questions, assignments, notes
+        ├── bank.sqlite                  # questions, assignments, notes (Claude queries this directly)
         ├── CLAUDE.md                    # instructions for external Claude (regenerated)
-        ├── BANK_CONTEXT.md              # approved + rejected snapshot (regenerated)
         ├── materials/                   # your course materials (add freely)
-        ├── imports/                     # XML files Claude generated (auto-cleaned)
+        ├── imports/                     # XML/JSON files Claude generated (auto-cleaned)
         └── exports/                     # assignment XML for import into Moodle
 ```
 

@@ -34,7 +34,6 @@ python3 -m venv .venv
 .venv/bin/question-bank            # default: serve web UI (browser NOT auto-opened)
 .venv/bin/question-bank --browser  # serve + auto-open browser
 .venv/bin/question-bank list       # list class names
-.venv/bin/question-bank export-context <class>   # regenerate CLAUDE.md + BANK_CONTEXT.md
 
 # override data location (defaults to ~/question_bank/)
 QUESTION_BANK_ROOT=/tmp/test .venv/bin/question-bank
@@ -74,9 +73,13 @@ ln -sf $(pwd)/.venv/bin/question-bank ~/.local/bin/question-bank
   assignment. Emits a `<category>` block only when the category changes
   between consecutive questions. Writes to `<class>/exports/<name>.xml`.
 - [`context.py`](src/question_bank/context.py) — generates
-  `<class>/CLAUDE.md` (static instructions template) and
-  `<class>/BANK_CONTEXT.md` (snapshot of approved + rejected questions with
-  rejection notes). Regenerated from scratch every run.
+  `<class>/CLAUDE.md`, a static instructions template that documents the
+  DB schema and example `sqlite3` queries for the external Claude.
+  `context.refresh(class_name)` is called on class creation and on app
+  startup only (the file content doesn't depend on DB state). It also
+  deletes the now-obsolete `BANK_CONTEXT.md` file if one is lying around
+  from an earlier version — Claude now queries `bank.sqlite` directly
+  instead of reading a pre-rendered snapshot.
 - [`app.py`](src/question_bank/app.py) — the NiceGUI app + CLI entry point.
   Page handlers use `@ui.page("/path")`. `open_db(class_name)` is a
   context manager that opens a fresh connection per action.

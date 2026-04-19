@@ -7,7 +7,16 @@ from urllib.parse import quote_plus
 
 from nicegui import app, ui
 
-from . import context, db, exporter, importer, moodle_xml, paths, preview
+from . import (
+    assignment_importer,
+    context,
+    db,
+    exporter,
+    importer,
+    moodle_xml,
+    paths,
+    preview,
+)
 from .moodle_xml import format_category_for_display
 
 
@@ -74,6 +83,7 @@ def home() -> None:
             paths.ensure_class_dirs(name)
             with open_db(name) as conn:
                 pass  # creating the DB initializes schema
+            context.refresh(name)
             new_name.value = ""
             _render_class_list(container)
             if name != raw.strip():
@@ -136,7 +146,7 @@ def class_dashboard(class_name: str) -> None:
 
     with ui.row().classes("gap-2 mt-4"):
         ui.button(
-            "Import XML",
+            "Import",
             on_click=lambda: ui.navigate.to(f"/class/{class_name}/import"),
         ).props("color=primary")
         ui.button(
@@ -171,17 +181,23 @@ def import_page(class_name: str) -> None:
         ui.button(
             "← Class", on_click=lambda: ui.navigate.to(f"/class/{class_name}")
         ).props("flat")
-        ui.label(f"Import XML — {class_name}").classes("text-xl font-bold")
+        ui.label(f"Import — {class_name}").classes("text-xl font-bold")
 
     ui.label(
-        "Supported question types: multichoice, truefalse, numerical. "
-        "Duplicates (same normalized stem text) are skipped."
+        "XML files are question banks (multichoice, truefalse, numerical); "
+        "duplicates are skipped. JSON files are assignment plans that pick "
+        "existing approved questions into a new assignment."
     ).classes("text-sm text-gray-600 mt-2")
 
     report_area = ui.column().classes("w-full mt-4")
     file_list_area = ui.column().classes("w-full mt-2")
 
-    def import_existing(path) -> None:
+    def refresh_files() -> None:
+        _render_imports_dir(
+            file_list_area, class_name, import_xml, import_assignment_json
+        )
+
+    def import_xml(path) -> None:
         try:
             with open_db(class_name) as conn:
                 report = importer.import_file(conn, path)
@@ -189,9 +205,24 @@ def import_page(class_name: str) -> None:
             ui.notify(f"Import failed: {exc}", type="negative")
             return
         _render_import_report(report_area, class_name, report)
-        _render_imports_dir(file_list_area, class_name, import_existing)
+        refresh_files()
 
-    _render_imports_dir(file_list_area, class_name, import_existing)
+    def import_assignment_json(path) -> None:
+        try:
+            with open_db(class_name) as conn:
+                report = assignment_importer.import_assignment_file(
+                    conn, class_name, path
+                )
+        except assignment_importer.AssignmentImportError as exc:
+            ui.notify(f"Assignment import failed: {exc}", type="negative")
+            return
+        except Exception as exc:
+            ui.notify(f"Assignment import failed: {exc}", type="negative")
+            return
+        _render_assignment_import_report(report_area, class_name, report)
+        refresh_files()
+
+    refresh_files()
 
     ui.separator().classes("my-4")
 
@@ -201,28 +232,45 @@ def import_page(class_name: str) -> None:
 
     async def handle_upload(e) -> None:
         data: bytes = await e.file.read()
+        fname = e.file.name or ""
+        is_json = fname.lower().endswith(".json")
         try:
             with open_db(class_name) as conn:
-                report = importer.import_bytes(conn, data, filename=e.file.name)
+                if is_json:
+                    report = assignment_importer.import_assignment_bytes(
+                        conn, class_name, data
+                    )
+                    _render_assignment_import_report(
+                        report_area, class_name, report
+                    )
+                else:
+                    report = importer.import_bytes(conn, data, filename=fname)
+                    _render_import_report(report_area, class_name, report)
+        except assignment_importer.AssignmentImportError as exc:
+            ui.notify(f"Assignment import failed: {exc}", type="negative")
+            return
         except Exception as exc:
             ui.notify(f"Import failed: {exc}", type="negative")
             return
-        _render_import_report(report_area, class_name, report)
-        _render_imports_dir(file_list_area, class_name, import_existing)
+        refresh_files()
 
     ui.upload(
-        label="Drop Moodle XML here",
+        label="Drop Moodle XML or assignment JSON here",
         on_upload=handle_upload,
         multiple=False,
         auto_upload=True,
-    ).props('accept=".xml"').classes("w-full")
+    ).props('accept=".xml,.json"').classes("w-full")
 
 
-def _render_imports_dir(container, class_name: str, on_import) -> None:
+def _render_imports_dir(container, class_name: str, on_xml, on_json) -> None:
     container.clear()
     imports_dir = paths.class_imports_dir(class_name)
     files = sorted(
-        (p for p in imports_dir.glob("*.xml") if p.is_file()),
+        (
+            p
+            for p in imports_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".xml", ".json")
+        ),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -231,17 +279,16 @@ def _render_imports_dir(container, class_name: str, on_import) -> None:
             ui.label(f"Files in imports/  ({len(files)})").classes(
                 "text-lg font-semibold"
             )
-            ui.button(
-                "Refresh",
-                on_click=lambda: _render_imports_dir(container, class_name, on_import),
-            ).props("flat dense")
+            ui.button("Refresh", on_click=lambda: _render_imports_dir(
+                container, class_name, on_xml, on_json
+            )).props("flat dense")
         ui.label(f"~/question_bank/classes/{class_name}/imports/").classes(
             "text-xs text-gray-500 font-mono"
         )
         if not files:
             ui.label(
-                "No XML files in imports/ yet. When Claude writes one here, "
-                "refresh to see it."
+                "No XML or JSON files in imports/ yet. When Claude writes one "
+                "here, refresh to see it."
             ).classes("text-gray-500 italic mt-1")
             return
         from datetime import datetime
@@ -251,17 +298,20 @@ def _render_imports_dir(container, class_name: str, on_import) -> None:
             mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime(
                 "%Y-%m-%d %H:%M"
             )
+            is_json = p.suffix.lower() == ".json"
+            kind_label = "assignment plan" if is_json else "question bank"
+            handler = on_json if is_json else on_xml
             with ui.card().classes("w-full"):
                 with ui.row().classes("w-full items-center no-wrap gap-3"):
                     ui.button(
                         "Import",
-                        on_click=lambda _, path=p: on_import(path),
+                        on_click=lambda _, path=p, h=handler: h(path),
                     ).props("color=primary")
                     with ui.column().classes("gap-0 flex-grow"):
                         ui.label(p.name).classes("font-semibold")
-                        ui.label(f"{size_kb:.1f} KB · modified {mtime}").classes(
-                            "text-xs text-gray-500"
-                        )
+                        ui.label(
+                            f"{kind_label} · {size_kb:.1f} KB · modified {mtime}"
+                        ).classes("text-xs text-gray-500")
 
 
 def _render_import_report(container: ui.column, class_name: str, report) -> None:
@@ -292,6 +342,37 @@ def _render_import_report(container: ui.column, class_name: str, report) -> None
             ui.button(
                 f"Go to review queue ({len(report.inserted)} new)",
                 on_click=lambda: ui.navigate.to(f"/class/{class_name}/review"),
+            ).props("color=primary").classes("mt-2")
+
+
+def _render_assignment_import_report(
+    container: ui.column, class_name: str, report
+) -> None:
+    container.clear()
+    with container:
+        ui.label(f"Assignment: {report.assignment_name}").classes(
+            "text-lg font-semibold mt-2"
+        )
+        if report.description:
+            ui.label(report.description).classes("text-sm text-gray-600 italic")
+        with ui.row().classes("gap-4"):
+            ui.label(
+                f"Questions added: {len(report.added_question_ids)}"
+            ).classes("text-positive")
+            if report.skipped:
+                ui.label(f"Skipped: {len(report.skipped)}").classes("text-warning")
+        if report.skipped:
+            with ui.expansion("Skipped entries").classes("w-full mt-2"):
+                for qid, reason in report.skipped:
+                    ui.label(f"[id={qid}] {reason}").classes("font-mono text-sm")
+        for w in report.warnings:
+            ui.label(w).classes("text-warning")
+        if report.assignment_id is not None:
+            ui.button(
+                "Open assignment",
+                on_click=lambda: ui.navigate.to(
+                    f"/class/{class_name}/assignments/{report.assignment_id}"
+                ),
             ).props("color=primary").classes("mt-2")
 
 
@@ -1196,6 +1277,8 @@ def _confirm_delete_assignment(class_name: str, aid: int) -> None:
 def _serve(show_browser: bool = False) -> None:
     paths.data_root().mkdir(parents=True, exist_ok=True)
     paths.classes_root().mkdir(parents=True, exist_ok=True)
+    for cname in paths.list_classes():
+        context.refresh(cname)
     ui.run(
         title="Question Bank",
         port=8765,
@@ -1203,18 +1286,6 @@ def _serve(show_browser: bool = False) -> None:
         show=show_browser,
         storage_secret="question-bank-local",
     )
-
-
-def _cmd_export_context(class_name: str) -> int:
-    norm = paths.normalize_class_name(class_name)
-    if norm not in paths.list_classes():
-        print(f"error: class '{norm}' not found", flush=True)
-        print(f"available: {', '.join(paths.list_classes()) or '(none)'}")
-        return 1
-    instructions_path, bank_path = context.export_all(norm)
-    print(f"wrote {instructions_path}")
-    print(f"wrote {bank_path}")
-    return 0
 
 
 def _cmd_list_classes() -> int:
@@ -1241,11 +1312,6 @@ def main() -> int:
             help="auto-open the UI in your default browser on startup",
         )
     sub.add_parser("list", help="List existing classes")
-    ec = sub.add_parser(
-        "export-context",
-        help="Write CLAUDE.md + BANK_CONTEXT.md into a class directory",
-    )
-    ec.add_argument("class_name", help="Name of the class")
 
     # Argparse clobbers the top-level flag when the subparser redefines it.
     # Sniff argv directly so --browser works anywhere on the command line.
@@ -1258,8 +1324,6 @@ def main() -> int:
         return 0
     if args.cmd == "list":
         return _cmd_list_classes()
-    if args.cmd == "export-context":
-        return _cmd_export_context(args.class_name)
     parser.print_help()
     return 2
 

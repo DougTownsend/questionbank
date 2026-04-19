@@ -94,8 +94,148 @@ def test_export_round_trip_parses_with_own_parser(conn_with_approved, tmp_path):
         "truefalse",
         "numerical",
     }
+    # every question ends up under a single category named after the assignment
     for q in result.questions:
-        assert q.raw_category == "$course$/ECE212/Chapter 3/Caches"
+        assert q.raw_category == "$course$/Quiz 1"
+
+
+def test_export_uses_assignment_name_as_sole_category(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Quiz 3 — Caches")
+    for q in db.list_questions(conn, status="approved"):
+        db.add_question_to_assignment(conn, aid, q["id"])
+    xml = exporter.build_assignment_xml(conn, aid)
+
+    root = etree.fromstring(xml.encode("utf-8"))
+    category_questions = [
+        q for q in root.findall("question") if q.get("type") == "category"
+    ]
+    assert len(category_questions) == 1
+    cat_text = category_questions[0].find("category/text").text
+    assert cat_text == "$course$/Quiz 3 — Caches"
+
+
+def test_export_wraps_text_nodes_in_cdata(conn_with_approved):
+    """Moodle rejects entity-escaped HTML in <text>; export must emit CDATA."""
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    for q in db.list_questions(conn, status="approved"):
+        db.add_question_to_assignment(conn, aid, q["id"])
+    xml = exporter.build_assignment_xml(conn, aid)
+    assert "<![CDATA[" in xml
+    # ensure HTML bits are inside CDATA rather than entity-escaped
+    assert "&lt;p&gt;" not in xml
+
+
+def test_export_flattens_mixed_content_in_text(tmp_path):
+    """If Claude's XML accidentally terminated a CDATA early (']]>' mid-HTML),
+    lxml parses real subelements inside <text>. Export must flatten these
+    back into a CDATA string so Moodle accepts the file."""
+    conn = db.connect(tmp_path / "bank.sqlite")
+    # raw_xml where CDATA terminates early and <i>...</i> becomes a real child
+    # of <text>; subsequent text is the <i>'s tail.
+    busted_raw = (
+        '<question type="multichoice">'
+        "<name><text>Q</text></name>"
+        "<questiontext format=\"html\"><text>stem</text></questiontext>"
+        "<defaultgrade>1.0</defaultgrade>"
+        "<penalty>0.333</penalty>"
+        "<hidden>0</hidden>"
+        "<single>true</single>"
+        "<shuffleanswers>true</shuffleanswers>"
+        "<answernumbering>abc</answernumbering>"
+        "<answer fraction=\"100\" format=\"html\">"
+        "<text>right</text>"
+        "<feedback format=\"html\"><text>ok</text></feedback>"
+        "</answer>"
+        "<answer fraction=\"0\" format=\"html\">"
+        "<text>wrong</text>"
+        "<feedback format=\"html\">"
+        "<text>refers to the <i>topology</i> of the circuit</text>"
+        "</feedback>"
+        "</answer>"
+        "</question>"
+    )
+    qid = db.insert_question(
+        conn,
+        moodle_type="multichoice",
+        name="Q",
+        stem_html="stem",
+        stem_hash="h",
+        raw_xml=busted_raw,
+        raw_category=None,
+        default_grade=1.0,
+        penalty=0.333,
+        general_feedback_html=None,
+        source_import_id=None,
+        answers=[
+            {"text_html": "right", "fraction": 100.0, "feedback_html": "ok"},
+            {"text_html": "wrong", "fraction": 0.0, "feedback_html": "..."},
+        ],
+    )
+    db.set_status(conn, qid, "approved")
+    aid = db.create_assignment(conn, "Mixed")
+    db.add_question_to_assignment(conn, aid, qid)
+    xml = exporter.build_assignment_xml(conn, aid)
+
+    root = etree.fromstring(xml.encode("utf-8"))
+    # no <text> element should have child elements in the exported XML
+    for t in root.iter("text"):
+        assert len(list(t)) == 0, (
+            f"<text> still has child elements: "
+            f"{etree.tostring(t, encoding='unicode')}"
+        )
+    # the italic content survives as text inside the CDATA
+    assert "<i>topology</i>" in xml
+    assert "<![CDATA[" in xml
+
+
+def test_export_handles_entity_escaped_raw_xml(tmp_path):
+    """A question whose raw_xml has entity-escaped HTML (e.g. from a pre-fix
+    DB row) should still export with proper CDATA."""
+    conn = db.connect(tmp_path / "bank.sqlite")
+    legacy_raw = (
+        '<question type="truefalse">'
+        "<name><text>Q</text></name>"
+        "<questiontext format=\"html\">"
+        "<text>&lt;p&gt;Is this true?&lt;/p&gt;</text>"
+        "</questiontext>"
+        "<answer fraction=\"100\" format=\"moodle_auto_format\">"
+        "<text>true</text>"
+        "<feedback format=\"html\"><text>yes</text></feedback>"
+        "</answer>"
+        "<answer fraction=\"0\" format=\"moodle_auto_format\">"
+        "<text>false</text>"
+        "<feedback format=\"html\"><text>no</text></feedback>"
+        "</answer>"
+        "</question>"
+    )
+    qid = db.insert_question(
+        conn,
+        moodle_type="truefalse",
+        name="Q",
+        stem_html="<p>Is this true?</p>",
+        stem_hash="h",
+        raw_xml=legacy_raw,
+        raw_category=None,
+        default_grade=1.0,
+        penalty=1.0,
+        general_feedback_html=None,
+        source_import_id=None,
+        answers=[
+            {"text_html": "true", "fraction": 100.0, "feedback_html": "yes"},
+            {"text_html": "false", "fraction": 0.0, "feedback_html": "no"},
+        ],
+    )
+    db.set_status(conn, qid, "approved")
+    aid = db.create_assignment(conn, "Legacy")
+    db.add_question_to_assignment(conn, aid, qid)
+    xml = exporter.build_assignment_xml(conn, aid)
+    assert "<![CDATA[" in xml
+    assert "Is this true?" in xml
+    assert "&lt;p&gt;" not in xml
+    # sanity: still parses as valid XML
+    etree.fromstring(xml.encode("utf-8"))
 
 
 def test_export_to_file_writes_under_class_exports(

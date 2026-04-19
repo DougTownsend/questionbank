@@ -53,7 +53,10 @@ def parse_file(path: Path | str) -> ParseResult:
 
 def parse_bytes(data: bytes) -> ParseResult:
     try:
-        root = etree.fromstring(data)
+        # strip_cdata=False keeps <![CDATA[...]]> sections intact so re-export
+        # round-trips (Moodle rejects entity-escaped HTML in <text>).
+        parser = etree.XMLParser(strip_cdata=False)
+        root = etree.fromstring(data, parser=parser)
     except etree.XMLSyntaxError as e:
         raise ParseError(f"invalid XML: {e}") from e
     if root.tag != "quiz":
