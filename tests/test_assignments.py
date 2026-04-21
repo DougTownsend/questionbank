@@ -99,6 +99,43 @@ def test_export_round_trip_parses_with_own_parser(conn_with_approved, tmp_path):
         assert q.raw_category == "$course$/Quiz 1"
 
 
+def test_add_question_defaults_to_one_point(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    q = db.list_questions(conn, status="approved")[0]
+    db.add_question_to_assignment(conn, aid, q["id"])
+    picked = db.list_assignment_questions(conn, aid)
+    # every picked question starts at 1 pt regardless of the question's
+    # own default_grade, so equally-weighted assignments are zero-work.
+    assert picked[0]["aq_point_value"] == 1.0
+
+
+def test_set_assignment_question_points_updates_value(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    q = db.list_questions(conn, status="approved")[0]
+    db.add_question_to_assignment(conn, aid, q["id"])
+    db.set_assignment_question_points(conn, aid, q["id"], 2.5)
+    picked = db.list_assignment_questions(conn, aid)
+    assert picked[0]["aq_point_value"] == 2.5
+
+
+def test_export_uses_overridden_point_value(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    qs = db.list_questions(conn, status="approved")
+    db.add_question_to_assignment(conn, aid, qs[0]["id"])
+    db.add_question_to_assignment(conn, aid, qs[1]["id"])
+    db.set_assignment_question_points(conn, aid, qs[0]["id"], 3.0)
+    # leave qs[1]'s point_value at the copied default (1.0)
+
+    xml = exporter.build_assignment_xml(conn, aid)
+    root = etree.fromstring(xml.encode("utf-8"))
+    non_cat = [q for q in root.findall("question") if q.get("type") != "category"]
+    grades = [float(q.find("defaultgrade").text) for q in non_cat]
+    assert grades == [3.0, 1.0]
+
+
 def test_export_uses_assignment_name_as_sole_category(conn_with_approved):
     conn = conn_with_approved
     aid = db.create_assignment(conn, "Quiz 3 — Caches")

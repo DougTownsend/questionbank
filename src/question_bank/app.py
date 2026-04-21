@@ -1100,8 +1100,10 @@ def _render_selected(container: ui.column, class_name: str, aid: int) -> None:
 
         for i, q in enumerate(picked):
             with ui.card().classes("w-full"):
-                with ui.row().classes("w-full items-center justify-between"):
-                    with ui.column().classes("gap-0"):
+                with ui.row().classes(
+                    "w-full items-center no-wrap gap-2"
+                ):
+                    with ui.column().classes("gap-0 flex-grow"):
                         ui.label(
                             f"{i + 1}. [{q['moodle_type']}] {q['name'] or '(unnamed)'}"
                         ).classes("font-semibold")
@@ -1110,6 +1112,15 @@ def _render_selected(container: ui.column, class_name: str, aid: int) -> None:
                             ui.label(cat_display).classes(
                                 "text-xs text-gray-500 font-mono"
                             )
+                    ui.number(
+                        label="Pts",
+                        value=q["aq_point_value"],
+                        step=0.5,
+                        min=0,
+                        on_change=lambda e, qid=q["id"]: _save_points(
+                            class_name, aid, qid, e.value
+                        ),
+                    ).classes("w-24").props("dense")
                     ui.button(
                         "Remove",
                         on_click=lambda _, qid=q["id"]: _remove_from_assignment(
@@ -1247,6 +1258,16 @@ def _remove_from_assignment(class_name: str, aid: int, qid: int) -> None:
         db.remove_question_from_assignment(conn, aid, qid)
     ui.notify("Removed", type="warning")
     ui.navigate.reload()
+
+
+def _save_points(class_name: str, aid: int, qid: int, raw_value) -> None:
+    try:
+        points = None if raw_value in (None, "") else float(raw_value)
+    except (TypeError, ValueError):
+        ui.notify("Points must be a number", type="warning")
+        return
+    with open_db(class_name) as conn:
+        db.set_assignment_question_points(conn, aid, qid, points)
 
 
 def _export_assignment(class_name: str, aid: int) -> None:

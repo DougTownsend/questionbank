@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS assignment_questions (
     assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
     question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
     ord INTEGER NOT NULL,
+    point_value REAL,
     UNIQUE(assignment_id, question_id)
 );
 
@@ -96,6 +97,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
     row = cur.fetchone()
     if row is None:
         conn.execute("INSERT INTO schema_info (version) VALUES (?)", (SCHEMA_VERSION,))
+        return
+    current = row["version"]
+    if current < 2:
+        _add_column_if_missing(conn, "assignment_questions", "point_value", "REAL")
+        conn.execute("UPDATE schema_info SET version = 2")
+        current = 2
+    if current < 3:
+        # every picked question now defaults to 1 point; backfill any NULLs
+        # (rows added before point_value existed, or copied from a question's
+        # default_grade back when that was the add-time default).
+        conn.execute(
+            "UPDATE assignment_questions SET point_value = 1.0 "
+            "WHERE point_value IS NULL"
+        )
+        conn.execute("UPDATE schema_info SET version = 3")
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, type_sql: str
+) -> None:
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_sql}")
 
 
 def create_import(conn: sqlite3.Connection, filename: str, n_questions: int) -> int:
@@ -351,7 +375,7 @@ def list_assignment_questions(
 ) -> list[sqlite3.Row]:
     return list(
         conn.execute(
-            """SELECT q.*, aq.ord AS aq_ord
+            """SELECT q.*, aq.ord AS aq_ord, aq.point_value AS aq_point_value
                FROM assignment_questions aq
                JOIN questions q ON q.id = aq.question_id
                WHERE aq.assignment_id = ?
@@ -364,7 +388,9 @@ def list_assignment_questions(
 def add_question_to_assignment(
     conn: sqlite3.Connection, assignment_id: int, question_id: int
 ) -> bool:
-    """Append a question to the end of an assignment. Returns False if already present."""
+    """Append a question to the end of an assignment. Returns False if already
+    present. Every added question starts at 1 point — the professor can tweak
+    it per-assignment afterward."""
     existing = conn.execute(
         "SELECT 1 FROM assignment_questions WHERE assignment_id = ? AND question_id = ?",
         (assignment_id, question_id),
@@ -377,7 +403,9 @@ def add_question_to_assignment(
     ).fetchone()
     next_ord = (max_row["m"] + 1) if max_row else 0
     conn.execute(
-        "INSERT INTO assignment_questions (assignment_id, question_id, ord) VALUES (?, ?, ?)",
+        """INSERT INTO assignment_questions
+           (assignment_id, question_id, ord, point_value)
+           VALUES (?, ?, ?, 1.0)""",
         (assignment_id, question_id, next_ord),
     )
     conn.execute(
@@ -385,6 +413,23 @@ def add_question_to_assignment(
         (assignment_id,),
     )
     return True
+
+
+def set_assignment_question_points(
+    conn: sqlite3.Connection,
+    assignment_id: int,
+    question_id: int,
+    point_value: float | None,
+) -> None:
+    conn.execute(
+        """UPDATE assignment_questions SET point_value = ?
+           WHERE assignment_id = ? AND question_id = ?""",
+        (point_value, assignment_id, question_id),
+    )
+    conn.execute(
+        "UPDATE assignments SET updated_at = datetime('now') WHERE id = ?",
+        (assignment_id,),
+    )
 
 
 def remove_question_from_assignment(
