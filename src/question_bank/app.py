@@ -13,6 +13,7 @@ from . import (
     db,
     exporter,
     importer,
+    latex_exporter,
     moodle_xml,
     paths,
     preview,
@@ -1082,11 +1083,23 @@ def _render_selected(container: ui.column, class_name: str, aid: int) -> None:
             ui.label(f"In this assignment ({len(picked)})").classes(
                 "text-lg font-semibold"
             )
-            with ui.row().classes("gap-2"):
+            with ui.row().classes("gap-2 flex-wrap"):
                 ui.button(
-                    "Export XML",
+                    "Export Moodle XML",
                     on_click=lambda: _export_assignment(class_name, aid),
                 ).props("color=primary").set_enabled(len(picked) > 0)
+                ui.button(
+                    "LaTeX (student)",
+                    on_click=lambda: _export_assignment_latex(
+                        class_name, aid, include_answer_key=False
+                    ),
+                ).props("color=primary outline").set_enabled(len(picked) > 0)
+                ui.button(
+                    "LaTeX (with answer key)",
+                    on_click=lambda: _export_assignment_latex(
+                        class_name, aid, include_answer_key=True
+                    ),
+                ).props("color=primary outline").set_enabled(len(picked) > 0)
                 ui.button(
                     "Delete assignment",
                     on_click=lambda: _confirm_delete_assignment(class_name, aid),
@@ -1274,6 +1287,17 @@ def _export_assignment(class_name: str, aid: int) -> None:
     with open_db(class_name) as conn:
         path = exporter.export_assignment_to_file(conn, class_name, aid)
     ui.notify(f"Exported: {path}", type="positive", timeout=10000)
+
+
+def _export_assignment_latex(
+    class_name: str, aid: int, *, include_answer_key: bool
+) -> None:
+    with open_db(class_name) as conn:
+        path = latex_exporter.export_assignment_to_latex_file(
+            conn, class_name, aid, include_answer_key=include_answer_key
+        )
+    kind = "with answer key" if include_answer_key else "student copy"
+    ui.notify(f"Exported LaTeX ({kind}): {path}", type="positive", timeout=10000)
 
 
 def _confirm_delete_assignment(class_name: str, aid: int) -> None:
