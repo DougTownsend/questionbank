@@ -95,10 +95,11 @@ These are locked in and shouldn't be reversed without checking with the user:
   app produces context files and reads Claude's XML output. Don't add HTTP
   calls to Anthropic's API.
 - **Local-only, single-user.** No auth, no server, no multi-user state.
-- **v1 question types**: `multichoice`, `truefalse`, `numerical`. Others are
-  silently dropped on import. Adding new types means updating `SUPPORTED_TYPES`
-  in `moodle_xml.py`, extending `preview.py` renderers, and updating the
-  CLAUDE.md templates.
+- **v1 question types**: `multichoice` (both single-answer and Moodle
+  multi-response/select-all), `truefalse`, `numerical`. Others are silently
+  dropped on import. Adding new types means updating `SUPPORTED_TYPES` in
+  `moodle_xml.py`, extending `preview.py` renderers, and updating the CLAUDE.md
+  templates.
 - **Rejection reasons are free-text**, not a picklist. Stored verbatim in
   `rejection_notes.note_text` and echoed into `BANK_CONTEXT.md` for Claude
   to learn from.
@@ -110,6 +111,11 @@ These are locked in and shouldn't be reversed without checking with the user:
   Exact-match remains in effect for all types.
 - **Every question keeps its raw XML** (`questions.raw_xml`) so re-export
   is lossless even for types/attributes we don't fully model.
+- **Embedded Moodle files are supported.** Question HTML may reference an
+  attachment with `@@PLUGINFILE@@/filename.png` while the corresponding
+  `<file encoding="base64">` element remains in `raw_xml`. Preview rendering
+  converts these references to data URLs for the browser; Moodle XML export
+  keeps the original attachment markup intact.
 - **Topic model is hybrid**: questions carry a Moodle `<category>` string
   (`raw_category`), plus eventually free-form tags. Tags table is not yet
   implemented (v0.2).

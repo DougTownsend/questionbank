@@ -8,49 +8,81 @@ from pathlib import Path
 from . import db, paths
 from .exporter import _safe_filename
 
-_LATEX_PREAMBLE = r"""\documentclass[11pt]{article}
+_LATEX_PREAMBLE = r"""\documentclass[10pt]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage{textcomp}
-\usepackage[margin=1in]{geometry}
+\usepackage[margin=0.75in]{geometry}
 \usepackage{enumitem}
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{parskip}
+\usepackage{needspace}
 \usepackage[most]{tcolorbox}
+\setlength{\parskip}{0.3em}
+\setlength{\parindent}{0pt}
+\linespread{0.95}
 \definecolor{feedbackgray}{gray}{0.93}
 \definecolor{feedbackgreen}{HTML}{DFF5DD}
 \newtcolorbox{feedbackbox}{
   enhanced,
   colback=feedbackgray, colframe=feedbackgray,
   boxrule=0pt, arc=1.5pt,
-  left=5pt, right=5pt, top=3pt, bottom=3pt,
-  before skip=2pt, after skip=4pt,
+  left=4pt, right=4pt, top=1.5pt, bottom=1.5pt,
+  before skip=1pt, after skip=2pt,
   breakable,
 }
 \newtcolorbox{correctbox}{
   enhanced,
   colback=feedbackgreen, colframe=feedbackgreen,
   boxrule=0pt, arc=1.5pt,
-  left=5pt, right=5pt, top=3pt, bottom=3pt,
-  before skip=2pt, after skip=4pt,
+  left=4pt, right=4pt, top=1.5pt, bottom=1.5pt,
+  before skip=1pt, after skip=2pt,
   breakable,
 }
+% Question wrapper: each question body goes in a minipage so the stem, its
+% choices, and their feedback stay together on one page (never split mid-
+% question). `\Needspace*` beforehand bumps us to the next page if there
+% isn't enough room left.
+\newenvironment{qblock}[1][10]{%
+  \Needspace*{#1\baselineskip}%
+  \begin{minipage}[t]{\dimexpr\linewidth-0.5em}%
+}{%
+  \end{minipage}%
+}
 """
+
+
+VALID_ASSIGNMENT_MODES = ("student", "key", "answers_only")
 
 
 def build_assignment_latex(
     conn: sqlite3.Connection,
     assignment_id: int,
     *,
-    include_answer_key: bool,
+    mode: str,
 ) -> str:
+    """Render an assignment to LaTeX. ``mode`` selects the variant:
+
+    - ``"student"``     — questions only, blank affordances, no feedback.
+    - ``"key"``         — full detailed key (correct option marked,
+      per-choice feedback, general feedback) inlined under each question.
+    - ``"answers_only"`` — compact grading sheet: just the question number
+      and the correct answer (letter / value / True/False)."""
+    if mode not in VALID_ASSIGNMENT_MODES:
+        raise ValueError(
+            f"mode must be one of {VALID_ASSIGNMENT_MODES!r}, got {mode!r}"
+        )
     assignment = db.get_assignment(conn, assignment_id)
     if assignment is None:
         raise ValueError(f"assignment {assignment_id} not found")
     questions = db.list_assignment_questions(conn, assignment_id)
 
+    if mode == "answers_only":
+        return _build_answers_only_latex(conn, assignment, questions)
+
+    include_answer_key = mode == "key"
     lines: list[str] = [_LATEX_PREAMBLE]
     lines.append(f"\\title{{{_escape_latex(assignment['name'])}}}")
     lines.append(r"\author{}")
@@ -60,9 +92,14 @@ def build_assignment_latex(
     lines.append(r"\maketitle")
     lines.append("")
 
-    lines.append(r"\begin{enumerate}[leftmargin=*, itemsep=2em]")
+    lines.append(r"\begin{enumerate}[leftmargin=*, itemsep=0.8em]")
     for q in questions:
-        lines.append(_render_question_body(conn, q, include_answer_key))
+        pts = q["aq_point_value"] if q["aq_point_value"] is not None else 1.0
+        lines.append(
+            _render_question_body(
+                conn, q, include_answer_key, pts_label=_fmt_points(pts)
+            )
+        )
     lines.append(r"\end{enumerate}")
     lines.append("")
 
@@ -71,23 +108,148 @@ def build_assignment_latex(
     return "\n".join(lines)
 
 
+def _build_answers_only_latex(
+    conn: sqlite3.Connection, assignment, questions
+) -> str:
+    """Compact grading sheet: '1. (c)  [1 pt]', '2. True', '3. 6 ± 0.1', ..."""
+    lines: list[str] = [_LATEX_PREAMBLE]
+    title = f"Answer key — {assignment['name']}"
+    lines.append(f"\\title{{{_escape_latex(title)}}}")
+    lines.append(r"\author{}")
+    lines.append(r"\date{}")
+    lines.append("")
+    lines.append(r"\begin{document}")
+    lines.append(r"\maketitle")
+    lines.append("")
+    lines.append(r"\begin{enumerate}[leftmargin=*, itemsep=0.2em]")
+    for q in questions:
+        ans = _render_answer_summary(conn, q)
+        pts = q["aq_point_value"] if q["aq_point_value"] is not None else 1.0
+        lines.append(
+            f"  \\item {ans} \\hfill {{\\small {_fmt_points(pts)}}}"
+        )
+    lines.append(r"\end{enumerate}")
+    lines.append("")
+    lines.append(r"\end{document}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_answer_summary(conn: sqlite3.Connection, q) -> str:
+    qtype = q["moodle_type"]
+    answers = db.get_answers(conn, q["id"])
+    if qtype == "multichoice":
+        threshold = 0 if q["multichoice_single"] == 0 else 99.999
+        letters = [
+            f"({chr(ord('a') + i)})"
+            for i, a in enumerate(answers)
+            if (a["fraction"] or 0) > threshold
+        ]
+        return ", ".join(letters) or "(no correct answer marked)"
+    if qtype == "truefalse":
+        correct = next(
+            (a for a in answers if (a["fraction"] or 0) >= 99.999), None
+        )
+        if correct is None:
+            return "?"
+        return (
+            "True"
+            if (correct["text_html"] or "").strip().lower() == "true"
+            else "False"
+        )
+    if qtype == "numerical":
+        bits = []
+        for a in answers:
+            if (a["fraction"] or 0) >= 99.999:
+                val = (a["text_html"] or "").strip()
+                tol = a["tolerance"]
+                if tol:
+                    bits.append(
+                        f"{_escape_latex(val)} $\\pm$ {_escape_latex(str(tol))}"
+                    )
+                else:
+                    bits.append(_escape_latex(val))
+        return " or ".join(bits) or "?"
+    return "?"
+
+
+def build_bank_latex(
+    conn: sqlite3.Connection, class_name: str, *, include_feedback: bool
+) -> str:
+    """Dump every approved question in a class to a single LaTeX document,
+    grouped by category. If include_feedback, each question shows its
+    correct option, per-choice feedback, and general feedback (same layout
+    as the assignment 'with answer key' export). Otherwise it's a blank
+    reference: stem + options, no correctness markers."""
+    from .moodle_xml import format_category_for_display
+
+    questions = db.list_questions(conn, status="approved")
+    grouped: dict[str, list] = {}
+    for q in questions:
+        cat = format_category_for_display(q["raw_category"]) or "Uncategorized"
+        grouped.setdefault(cat, []).append(q)
+
+    title = f"{class_name} — Question bank"
+    if include_feedback:
+        title += " (with answer key)"
+
+    lines: list[str] = [_LATEX_PREAMBLE]
+    lines.append(f"\\title{{{_escape_latex(title)}}}")
+    lines.append(r"\author{}")
+    lines.append(r"\date{}")
+    lines.append("")
+    lines.append(r"\begin{document}")
+    lines.append(r"\maketitle")
+    lines.append("")
+
+    for cat in sorted(grouped.keys()):
+        lines.append(f"\\section*{{{_escape_latex(cat)}}}")
+        lines.append(r"\begin{enumerate}[leftmargin=*, itemsep=0.8em]")
+        for q in grouped[cat]:
+            lines.append(_render_question_body(conn, q, include_feedback))
+        lines.append(r"\end{enumerate}")
+        lines.append("")
+
+    lines.append(r"\end{document}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def export_bank_to_latex_file(
+    conn: sqlite3.Connection, class_name: str, *, include_feedback: bool
+) -> Path:
+    tex = build_bank_latex(conn, class_name, include_feedback=include_feedback)
+    out_dir = paths.class_exports_dir(class_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = _safe_filename(f"{class_name}_bank")
+    suffix = "_key" if include_feedback else ""
+    path = out_dir / f"{base}{suffix}.tex"
+    path.write_text(tex, encoding="utf-8")
+    return path
+
+
+_MODE_FILE_SUFFIX = {
+    "student": "",
+    "key": "_key",
+    "answers_only": "_answers",
+}
+
+
 def export_assignment_to_latex_file(
     conn: sqlite3.Connection,
     class_name: str,
     assignment_id: int,
     *,
-    include_answer_key: bool,
+    mode: str,
 ) -> Path:
     a = db.get_assignment(conn, assignment_id)
     if a is None:
         raise ValueError(f"assignment {assignment_id} not found")
-    tex = build_assignment_latex(
-        conn, assignment_id, include_answer_key=include_answer_key
-    )
+    tex = build_assignment_latex(conn, assignment_id, mode=mode)
     out_dir = paths.class_exports_dir(class_name)
     out_dir.mkdir(parents=True, exist_ok=True)
     base = _safe_filename(a["name"])
-    suffix = "_key" if include_answer_key else ""
+    suffix = _MODE_FILE_SUFFIX[mode]
     path = out_dir / f"{base}{suffix}.tex"
     path.write_text(tex, encoding="utf-8")
     return path
@@ -97,22 +259,38 @@ def export_assignment_to_latex_file(
 
 
 def _render_question_body(
-    conn: sqlite3.Connection, q: sqlite3.Row, include_answer_key: bool
+    conn: sqlite3.Connection,
+    q: sqlite3.Row,
+    include_answer_key: bool,
+    pts_label: str | None = None,
 ) -> str:
     """Render one question. If `include_answer_key` is False, output a blank
     student-facing version (options, true/false toggle, numerical blank). If
     True, mark the correct option(s), show each option's specific feedback
-    underneath it, and append general feedback at the end of the question."""
-    points = q["aq_point_value"] if q["aq_point_value"] is not None else 1.0
-    pts_label = _fmt_points(points)
+    underneath it, and append general feedback at the end of the question.
+
+    If `pts_label` is given it's shown as a bold tag before the stem (used
+    by assignment exports). Bank exports pass None so the point tag is
+    omitted entirely."""
     qtype = q["moodle_type"]
     stem = _html_to_latex(q["stem_html"] or "")
     answers = db.get_answers(conn, q["id"])
 
-    parts: list[str] = [f"  \\item \\textbf{{[{pts_label}]}} {stem}"]
+    lead = f"\\textbf{{[{pts_label}]}} " if pts_label else ""
+    parts: list[str] = [
+        r"  \item\begin{qblock}",
+        f"  {lead}{stem}",
+    ]
 
     if qtype == "multichoice":
-        parts.extend(_render_mc_options(answers, include_answer_key))
+        multiple = q["multichoice_single"] == 0
+        if multiple:
+            parts.append(r"  \emph{Select all that apply.}")
+        parts.extend(
+            _render_mc_options(
+                answers, include_answer_key, multiple=multiple
+            )
+        )
     elif qtype == "truefalse":
         parts.extend(_render_tf_options(answers, include_answer_key))
     elif qtype == "numerical":
@@ -127,10 +305,13 @@ def _render_question_body(
             parts.append(f"  \\textit{{General feedback:}} {gf}")
             parts.append(r"  \end{feedbackbox}")
 
+    parts.append(r"  \end{qblock}")
     return "\n".join(parts)
 
 
-def _render_mc_options(answers: list, include_answer_key: bool) -> list[str]:
+def _render_mc_options(
+    answers: list, include_answer_key: bool, *, multiple: bool
+) -> list[str]:
     if not include_answer_key:
         out = [r"  \begin{enumerate}[label=(\alph*), leftmargin=2em]"]
         for a in answers:
@@ -138,9 +319,10 @@ def _render_mc_options(answers: list, include_answer_key: bool) -> list[str]:
         out.append(r"  \end{enumerate}")
         return out
 
-    out = [r"  \begin{enumerate}[label=(\alph*), leftmargin=2em, itemsep=0.5em]"]
+    out = [r"  \begin{enumerate}[label=(\alph*), leftmargin=2em, itemsep=0.25em]"]
     for a in answers:
-        is_correct = (a["fraction"] or 0) >= 99.999
+        fraction = a["fraction"] or 0
+        is_correct = fraction > 0 if multiple else fraction >= 99.999
         text = _html_to_latex(a["text_html"] or "")
         display = f"\\textbf{{{text} (correct)}}" if is_correct else text
         fb = _html_to_latex(a["feedback_html"] or "").strip()
@@ -159,7 +341,7 @@ def _render_tf_options(answers: list, include_answer_key: bool) -> list[str]:
         return [
             r"  \hfill \textbf{(circle one)} \quad True \quad / \quad False"
         ]
-    out = [r"  \begin{itemize}[leftmargin=2em, itemsep=0.5em, label={}]"]
+    out = [r"  \begin{itemize}[leftmargin=2em, itemsep=0.25em, label={}]"]
     for a in answers:
         is_correct = (a["fraction"] or 0) >= 99.999
         opt = (a["text_html"] or "").strip().capitalize() or "?"
@@ -303,6 +485,41 @@ _UNICODE_MAP = {
     "©": r"\copyright{}",
     "®": r"\textregistered{}",
     "™": r"\texttrademark{}",
+    # logic / circuit operators
+    "⊕": r"$\oplus$",
+    "⊖": r"$\ominus$",
+    "⊗": r"$\otimes$",
+    "⊙": r"$\odot$",
+    "⊘": r"$\oslash$",
+    "¬": r"$\neg$",
+    "∧": r"$\wedge$",
+    "∨": r"$\vee$",
+    "⊻": r"$\veebar$",
+    # sets / logic
+    "∀": r"$\forall$",
+    "∃": r"$\exists$",
+    "∈": r"$\in$",
+    "∉": r"$\notin$",
+    "⊆": r"$\subseteq$",
+    "⊇": r"$\supseteq$",
+    "⊂": r"$\subset$",
+    "⊃": r"$\supset$",
+    "∪": r"$\cup$",
+    "∩": r"$\cap$",
+    "∅": r"$\emptyset$",
+    # relations / misc math
+    "∴": r"$\therefore$",
+    "∵": r"$\because$",
+    "⊥": r"$\perp$",
+    "⊤": r"$\top$",
+    "∥": r"$\parallel$",
+    "∣": r"$\mid$",
+    "≪": r"$\ll$",
+    "≫": r"$\gg$",
+    "∓": r"$\mp$",
+    "↑": r"$\uparrow$",
+    "↓": r"$\downarrow$",
+    "↦": r"$\mapsto$",
 }
 
 
@@ -338,48 +555,180 @@ class _HtmlToLatex(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self.pre_depth = 0
+        # Tables: when self.in_table is True, we're collecting cells.
+        # `cell_parts` is None between cells (whitespace text is dropped) and
+        # a list while we're inside a <td>/<th> (LaTeX written there instead
+        # of self.parts).
+        self.in_table = False
+        self.table_rows: list[list[str]] = []
+        self.current_row: list[str] | None = None
+        self.cell_parts: list[str] | None = None
+
+    def _emit(self, s: str) -> None:
+        if self.cell_parts is not None:
+            self.cell_parts.append(s)
+        else:
+            self.parts.append(s)
 
     def handle_starttag(self, tag, attrs) -> None:
         tag = tag.lower()
+        if tag == "pre":
+            self.pre_depth += 1
+            self._emit("\n\\begin{flushleft}\\ttfamily\n")
+            return
+        if self.pre_depth > 0:
+            return
+        if tag == "table":
+            self.in_table = True
+            self.table_rows = []
+            return
+        if self.in_table:
+            if tag == "tr":
+                self.current_row = []
+                return
+            if tag in ("td", "th"):
+                # divert subsequent emit() calls into this cell's buffer
+                self.cell_parts = []
+                return
+            if tag in ("thead", "tbody", "tfoot", "caption", "colgroup", "col"):
+                # transparent wrappers — children still get processed
+                return
+            # other inline tags inside a cell fall through to normal handling
+            # so <code>/<b>/<sup> inside <td> render correctly
         if tag in self._WRAPPERS:
-            self.parts.append(self._WRAPPERS[tag][0])
+            self._emit(self._WRAPPERS[tag][0])
         elif tag == "br":
-            self.parts.append("\\\\\n")
+            self._emit("\\\\\n")
         elif tag == "p":
             pass
         elif tag == "ul":
-            self.parts.append("\n\\begin{itemize}\n")
+            self._emit("\n\\begin{itemize}\n")
         elif tag == "ol":
-            self.parts.append("\n\\begin{enumerate}\n")
+            self._emit("\n\\begin{enumerate}\n")
         elif tag == "li":
-            self.parts.append("\\item ")
+            self._emit("\\item ")
         # unknown tags: ignore
 
     def handle_endtag(self, tag) -> None:
         tag = tag.lower()
+        if tag == "pre":
+            self.pre_depth = max(0, self.pre_depth - 1)
+            self._emit("\n\\end{flushleft}\n")
+            return
+        if self.pre_depth > 0:
+            return
+        if self.in_table:
+            if tag == "table":
+                self.in_table = False
+                self.parts.append(_render_table_latex(self.table_rows))
+                self.table_rows = []
+                self.current_row = None
+                self.cell_parts = None
+                return
+            if tag == "tr":
+                if self.current_row is not None and self.current_row:
+                    self.table_rows.append(self.current_row)
+                self.current_row = None
+                return
+            if tag in ("td", "th"):
+                if self.cell_parts is not None and self.current_row is not None:
+                    self.current_row.append("".join(self.cell_parts).strip())
+                self.cell_parts = None
+                return
+            if tag in ("thead", "tbody", "tfoot", "caption", "colgroup", "col"):
+                return
         if tag in self._WRAPPERS:
-            self.parts.append(self._WRAPPERS[tag][1])
+            self._emit(self._WRAPPERS[tag][1])
         elif tag == "p":
-            self.parts.append("\n\n")
+            self._emit("\n\n")
         elif tag == "ul":
-            self.parts.append("\n\\end{itemize}\n")
+            self._emit("\n\\end{itemize}\n")
         elif tag == "ol":
-            self.parts.append("\n\\end{enumerate}\n")
+            self._emit("\n\\end{enumerate}\n")
 
     def handle_startendtag(self, tag, attrs) -> None:
         # handles <br/>
         self.handle_starttag(tag, attrs)
 
     def handle_data(self, data) -> None:
-        self.parts.append(_escape_latex(data))
+        if self.pre_depth > 0:
+            self._emit(_pre_to_latex(data))
+            return
+        if self.in_table and self.cell_parts is None:
+            # whitespace between table tags — drop it
+            return
+        self._emit(_escape_latex(data))
+
+
+def _render_table_latex(rows: list[list[str]]) -> str:
+    """Render a list of cell-rows (each cell's content is already
+    LaTeX-escaped) as a centered, fully-bordered tabular. Empty tables
+    produce nothing."""
+    if not rows:
+        return ""
+    n_cols = max(len(r) for r in rows)
+    col_spec = "|" + ("c|" * n_cols)
+    out: list[str] = ["\n\\begin{center}", f"\\begin{{tabular}}{{{col_spec}}}", r"\hline"]
+    for row in rows:
+        cells = list(row) + [""] * (n_cols - len(row))
+        out.append(" & ".join(cells) + r" \\")
+        out.append(r"\hline")
+    out.append(r"\end{tabular}")
+    out.append("\\end{center}\n")
+    return "\n".join(out)
+
+
+def _pre_to_latex(data: str) -> str:
+    """Render <pre>-block text inside a flushleft/ttfamily environment:
+    every newline becomes a forced LaTeX line break; ALL spaces become
+    non-breaking ~ so columns align identically to the HTML source (TeX
+    otherwise collapses runs of spaces, breaking label/operand alignment
+    in code blocks)."""
+    raw_lines = data.split("\n")
+    out_lines: list[str] = []
+    for line in raw_lines:
+        line = line.replace("\t", "    ")
+        esc = _escape_latex(line)
+        esc = esc.replace(" ", "~")
+        if not esc.strip("~"):
+            esc = "\\strut"
+        out_lines.append(esc)
+    while out_lines and out_lines[0] == "\\strut":
+        out_lines.pop(0)
+    while out_lines and out_lines[-1] == "\\strut":
+        out_lines.pop()
+    return "\\\\\n".join(out_lines)
+
+
+_CODE_BLOCK_RE = re.compile(r"<code>(.*?)</code>", re.DOTALL | re.IGNORECASE)
+_BR_INSIDE_CODE_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _promote_multiline_code_to_pre(html: str) -> str:
+    """If a <code> block contains real newlines or <br> tags, convert it
+    into a <pre> block so the LaTeX renderer treats it as multi-line. Single
+    line <code> stays inline. This catches multi-line code that Claude wrote
+    in an answer choice without a surrounding <pre>."""
+    def replace(m: re.Match) -> str:
+        inner = m.group(1)
+        has_newline = "\n" in inner
+        has_br = bool(_BR_INSIDE_CODE_RE.search(inner))
+        if not (has_newline or has_br):
+            return m.group(0)
+        if has_br:
+            inner = _BR_INSIDE_CODE_RE.sub("\n", inner)
+        return f"<pre>{inner}</pre>"
+    return _CODE_BLOCK_RE.sub(replace, html)
 
 
 _MULTI_BLANK_LINES = re.compile(r"\n{3,}")
 
 
 def _html_to_latex(html: str) -> str:
+    html = _promote_multiline_code_to_pre(html or "")
     parser = _HtmlToLatex()
-    parser.feed(html or "")
+    parser.feed(html)
     parser.close()
     text = "".join(parser.parts)
     text = _MULTI_BLANK_LINES.sub("\n\n", text)

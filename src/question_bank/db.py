@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
+
+_MULTISELECT_RE = re.compile(
+    r"<single\b[^>]*>\s*(?:false|0|no)\s*</single>", re.IGNORECASE
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -29,6 +34,7 @@ CREATE TABLE IF NOT EXISTS questions (
     default_grade REAL,
     penalty REAL,
     general_feedback_html TEXT,
+    multichoice_single INTEGER,
     source_import_id INTEGER REFERENCES imports(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -62,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_rejection_question ON rejection_notes(question_id
 CREATE TABLE IF NOT EXISTS assignments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    points_manually_adjusted INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -112,6 +119,43 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "WHERE point_value IS NULL"
         )
         conn.execute("UPDATE schema_info SET version = 3")
+        current = 3
+    if current < 4:
+        _add_column_if_missing(
+            conn,
+            "assignments",
+            "points_manually_adjusted",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        conn.execute(
+            """UPDATE assignments SET points_manually_adjusted = 1
+               WHERE EXISTS (
+                   SELECT 1 FROM assignment_questions aq
+                   WHERE aq.assignment_id = assignments.id
+                     AND ABS(COALESCE(aq.point_value, 1.0) - 1.0) > 0.000001
+               )"""
+        )
+        auto_assignment_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM assignments WHERE points_manually_adjusted = 0"
+            )
+        ]
+        for assignment_id in auto_assignment_ids:
+            _rebalance_assignment_points(conn, assignment_id)
+        conn.execute("UPDATE schema_info SET version = 4")
+        current = 4
+    if current < 5:
+        _add_column_if_missing(conn, "questions", "multichoice_single", "INTEGER")
+        for row in conn.execute(
+            "SELECT id, raw_xml FROM questions WHERE moodle_type = 'multichoice'"
+        ):
+            single = 0 if _MULTISELECT_RE.search(row["raw_xml"] or "") else 1
+            conn.execute(
+                "UPDATE questions SET multichoice_single = ? WHERE id = ?",
+                (single, row["id"]),
+            )
+        conn.execute("UPDATE schema_info SET version = 5")
 
 
 def _add_column_if_missing(
@@ -151,12 +195,14 @@ def insert_question(
     general_feedback_html: str | None,
     source_import_id: int | None,
     answers: list[dict],
+    multichoice_single: bool | None = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO questions
            (moodle_type, name, stem_html, stem_hash, raw_xml, raw_category,
-            default_grade, penalty, general_feedback_html, source_import_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            default_grade, penalty, general_feedback_html, multichoice_single,
+            source_import_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             moodle_type,
             name,
@@ -167,6 +213,12 @@ def insert_question(
             default_grade,
             penalty,
             general_feedback_html,
+            (
+                int(multichoice_single)
+                if moodle_type == "multichoice"
+                and multichoice_single is not None
+                else (1 if moodle_type == "multichoice" else None)
+            ),
             source_import_id,
         ),
     )
@@ -245,7 +297,16 @@ def set_status(
 def delete_question(conn: sqlite3.Connection, question_id: int) -> None:
     """Delete a question and everything that references it (answers, rejection
     notes, assignment_questions via cascade)."""
+    assignment_ids = [
+        row["assignment_id"]
+        for row in conn.execute(
+            "SELECT assignment_id FROM assignment_questions WHERE question_id = ?",
+            (question_id,),
+        )
+    ]
     conn.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+    for assignment_id in assignment_ids:
+        _rebalance_assignment_points_if_automatic(conn, assignment_id)
 
 
 def update_question(
@@ -259,11 +320,13 @@ def update_question(
     raw_category: str | None,
     general_feedback_html: str | None,
     answers: list[dict],
+    multichoice_single: bool | None = None,
 ) -> None:
     conn.execute(
         """UPDATE questions SET
            name = ?, stem_html = ?, stem_hash = ?, raw_xml = ?,
            raw_category = ?, general_feedback_html = ?,
+           multichoice_single = COALESCE(?, multichoice_single),
            updated_at = datetime('now')
            WHERE id = ?""",
         (
@@ -273,6 +336,11 @@ def update_question(
             raw_xml,
             raw_category,
             general_feedback_html,
+            (
+                int(multichoice_single)
+                if multichoice_single is not None
+                else None
+            ),
             question_id,
         ),
     )
@@ -388,9 +456,32 @@ def list_assignment_questions(
 def add_question_to_assignment(
     conn: sqlite3.Connection, assignment_id: int, question_id: int
 ) -> bool:
-    """Append a question to the end of an assignment. Returns False if already
-    present. Every added question starts at 1 point — the professor can tweak
-    it per-assignment afterward."""
+    """Append one question, balancing automatic assignments to 100 points."""
+    added = _append_question_to_assignment(conn, assignment_id, question_id)
+    if added:
+        _rebalance_assignment_points_if_automatic(conn, assignment_id)
+        _touch_assignment(conn, assignment_id)
+    return added
+
+
+def add_questions_to_assignment(
+    conn: sqlite3.Connection, assignment_id: int, question_ids: list[int]
+) -> list[int]:
+    """Append multiple questions in order and return the IDs actually added."""
+    added = [
+        question_id
+        for question_id in question_ids
+        if _append_question_to_assignment(conn, assignment_id, question_id)
+    ]
+    if added:
+        _rebalance_assignment_points_if_automatic(conn, assignment_id)
+        _touch_assignment(conn, assignment_id)
+    return added
+
+
+def _append_question_to_assignment(
+    conn: sqlite3.Connection, assignment_id: int, question_id: int
+) -> bool:
     existing = conn.execute(
         "SELECT 1 FROM assignment_questions WHERE assignment_id = ? AND question_id = ?",
         (assignment_id, question_id),
@@ -408,11 +499,41 @@ def add_question_to_assignment(
            VALUES (?, ?, ?, 1.0)""",
         (assignment_id, question_id, next_ord),
     )
+    return True
+
+
+def _rebalance_assignment_points_if_automatic(
+    conn: sqlite3.Connection, assignment_id: int
+) -> None:
+    assignment = get_assignment(conn, assignment_id)
+    if assignment is not None and not assignment["points_manually_adjusted"]:
+        _rebalance_assignment_points(conn, assignment_id)
+
+
+def _rebalance_assignment_points(
+    conn: sqlite3.Connection, assignment_id: int
+) -> None:
+    rows = conn.execute(
+        """SELECT id FROM assignment_questions
+           WHERE assignment_id = ? ORDER BY ord""",
+        (assignment_id,),
+    ).fetchall()
+    if not rows:
+        return
+    cents_each, extra_cents = divmod(10_000, len(rows))
+    for index, row in enumerate(rows):
+        cents = cents_each + (1 if index < extra_cents else 0)
+        conn.execute(
+            "UPDATE assignment_questions SET point_value = ? WHERE id = ?",
+            (cents / 100, row["id"]),
+        )
+
+
+def _touch_assignment(conn: sqlite3.Connection, assignment_id: int) -> None:
     conn.execute(
         "UPDATE assignments SET updated_at = datetime('now') WHERE id = ?",
         (assignment_id,),
     )
-    return True
 
 
 def set_assignment_question_points(
@@ -427,7 +548,9 @@ def set_assignment_question_points(
         (point_value, assignment_id, question_id),
     )
     conn.execute(
-        "UPDATE assignments SET updated_at = datetime('now') WHERE id = ?",
+        """UPDATE assignments
+           SET points_manually_adjusted = 1, updated_at = datetime('now')
+           WHERE id = ?""",
         (assignment_id,),
     )
 
@@ -448,7 +571,5 @@ def remove_question_from_assignment(
         conn.execute(
             "UPDATE assignment_questions SET ord = ? WHERE id = ?", (i, r["id"])
         )
-    conn.execute(
-        "UPDATE assignments SET updated_at = datetime('now') WHERE id = ?",
-        (assignment_id,),
-    )
+    _rebalance_assignment_points_if_automatic(conn, assignment_id)
+    _touch_assignment(conn, assignment_id)

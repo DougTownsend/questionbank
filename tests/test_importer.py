@@ -39,6 +39,25 @@ def test_multichoice_answers_persisted(tmp_path):
     assert len(correct) == 1
 
 
+def test_select_all_flag_persisted(tmp_path):
+    conn = db.connect(tmp_path / "bank.sqlite")
+    xml = b"""
+    <quiz><question type="multichoice">
+      <name><text>Select all</text></name>
+      <questiontext format="html"><text>Select all that apply.</text></questiontext>
+      <single>false</single>
+      <answer fraction="50"><text>A</text></answer>
+      <answer fraction="50"><text>B</text></answer>
+      <answer fraction="-50"><text>C</text></answer>
+    </question></quiz>
+    """
+
+    report = importer.import_bytes(conn, xml)
+
+    question = db.get_question(conn, report.inserted[0])
+    assert question["multichoice_single"] == 0
+
+
 def test_numerical_tolerance_persisted(tmp_path):
     conn = db.connect(tmp_path / "bank.sqlite")
     importer.import_file(conn, FIXTURES / "sample_questions.xml")

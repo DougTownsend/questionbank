@@ -53,12 +53,14 @@ don't dump the whole bank unless the professor asks.
 
 ## Schema (tables and columns you care about)
 
-- `questions(id, moodle_type, name, stem_html, raw_category, status,
-  general_feedback_html, created_at, updated_at)` — `status` is one of
+- `questions(id, moodle_type, multichoice_single, name, stem_html,
+  raw_category, status, general_feedback_html, created_at, updated_at)` —
+  `status` is one of
   `'pending'`, `'approved'`, or `'rejected'`.
 - `question_answers(id, question_id, ord, text_html, fraction,
-  feedback_html, tolerance)` — `fraction=100` is the correct answer
-  (or a correct-valued one in multi-answer), `0` is a distractor.
+  feedback_html, tolerance)` — in single-answer questions, `fraction=100`
+  is correct and `0` is a distractor. In select-all questions, positive
+  fractions identify correct selections and must total 100.
   `tolerance` only applies to `numerical`.
 - `rejection_notes(id, question_id, rejected_at, note_text)` — the
   professor's free-text reason for rejecting a question. Multiple rows
@@ -152,9 +154,35 @@ If the professor asks for N questions on a topic, produce exactly N.
 
 Only these three are imported; other types are silently dropped:
 
-- `multichoice` — single-answer multiple choice
+- `multichoice` — single-answer or select-all-that-apply multiple choice
 - `truefalse` — true/false
 - `numerical` — numeric fill-in-the-blank with tolerance
+
+## Embedded PNG images
+
+PNG images can be included directly in Moodle XML; do not use placeholder
+filenames that require the professor to upload images manually. Put an
+`<img>` reference in the HTML and a base64-encoded `<file>` element in the
+same formatted-text container. The question-bank preview resolves
+`@@PLUGINFILE@@` references, and assignment exports preserve the embedded
+file for Moodle.
+
+```xml
+<questiontext format="html">
+  <text><![CDATA[
+    <p><img src="@@PLUGINFILE@@/diagram.png"
+            alt="A concise description of the diagram"
+            style="max-width:100%;height:auto;"></p>
+  ]]></text>
+  <file name="diagram.png" path="/" encoding="base64">
+    BASE64_ENCODED_PNG_DATA
+  </file>
+</questiontext>
+```
+
+Use a unique, descriptive filename for every distinct image. Always include
+useful alt text. Keep generated PNGs tightly cropped and legible, and validate
+that every embedded payload decodes successfully before finishing the XML.
 
 ## Quality expectations
 
@@ -177,6 +205,11 @@ Only these three are imported; other types are silently dropped:
   also flags exact-match duplicates, but cleaner input is better.
 - **Learn from rejection notes.** If prior questions were rejected as
   "ambiguous", "too easy", or "wrong answer key", raise the bar.
+- **Multi-line code goes inside `<pre>`** — both in question stems AND in
+  answer choices. e.g. `<pre>LOOP  ADD R0, R0, R1\n      BRp LOOP</pre>`.
+  Plain `<code>` collapses whitespace in browsers and in the LaTeX
+  exporter, so inline code (one line) is fine in `<code>` but anything
+  spanning multiple lines or relying on column alignment must be `<pre>`.
 
 ## Moodle XML templates
 
@@ -204,6 +237,44 @@ Only these three are imported; other types are silently dropped:
   <answer fraction="0" format="html">
     <text>A plausible distractor</text>
     <feedback format="html"><text>The misconception this answer represents.</text></feedback>
+  </answer>
+</question>
+```
+
+### Select all that apply
+
+Use Moodle's `multichoice` type with `<single>false</single>`. Give every
+correct selection a positive fraction, with all positive fractions totaling
+exactly 100. Give incorrect selections negative fractions when practical so
+selecting every option does not earn credit. The stem must explicitly say
+"Select all that apply."
+
+```xml
+<question type="multichoice">
+  <name><text>Short title</text></name>
+  <questiontext format="html">
+    <text><![CDATA[<p>Select all that apply. Which statements are true?</p>]]></text>
+  </questiontext>
+  <generalfeedback format="html">
+    <text><![CDATA[<p>Explain every correct selection and the governing concept.</p>]]></text>
+  </generalfeedback>
+  <defaultgrade>1.0</defaultgrade>
+  <penalty>0.3333333</penalty>
+  <hidden>0</hidden>
+  <single>false</single>
+  <shuffleanswers>true</shuffleanswers>
+  <answernumbering>abc</answernumbering>
+  <answer fraction="50" format="html">
+    <text>A correct selection</text>
+    <feedback format="html"><text>Correct — explain why this statement applies.</text></feedback>
+  </answer>
+  <answer fraction="50" format="html">
+    <text>Another correct selection</text>
+    <feedback format="html"><text>Correct — explain why this statement applies.</text></feedback>
+  </answer>
+  <answer fraction="-50" format="html">
+    <text>An incorrect selection</text>
+    <feedback format="html"><text>Explain the misconception without revealing the other selections.</text></feedback>
   </answer>
 </question>
 ```
@@ -267,8 +338,11 @@ Only these three are imported; other types are silently dropped:
 - **Never let `]]>` appear inside CDATA content.** If your HTML needs a
   literal `]]>`, split it (`]]` + `>`) or rephrase. A stray `]]>`
   terminates the section and breaks the import.
-- `fraction="100"` on the correct answer; `fraction="0"` on distractors.
-  Partial-credit answers can use other values (e.g. `fraction="50"`).
+- For single-answer questions, use `fraction="100"` on the correct answer and
+  `fraction="0"` on distractors.
+- For select-all questions, use `<single>false</single>` and make all positive
+  answer fractions total exactly 100; use negative fractions for incorrect
+  selections when practical.
 - Every `<answer>` has a `<feedback>` element.
 - No `<?xml?>` declaration, no prose outside the `<quiz>` block.
 

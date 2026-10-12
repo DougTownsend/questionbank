@@ -50,6 +50,7 @@ def test_add_and_remove_questions_ordering(conn_with_approved):
     picked = db.list_assignment_questions(conn, aid)
     assert [p["id"] for p in picked] == [qs[0]["id"], qs[2]["id"]]
     assert [p["aq_ord"] for p in picked] == [0, 1]  # compacted
+    assert [p["aq_point_value"] for p in picked] == [50.0, 50.0]
 
 
 def test_delete_assignment_cascades(conn_with_approved):
@@ -99,15 +100,37 @@ def test_export_round_trip_parses_with_own_parser(conn_with_approved, tmp_path):
         assert q.raw_category == "$course$/Quiz 1"
 
 
-def test_add_question_defaults_to_one_point(conn_with_approved):
+def test_automatic_points_always_total_100(conn_with_approved):
     conn = conn_with_approved
     aid = db.create_assignment(conn, "Q")
-    q = db.list_questions(conn, status="approved")[0]
-    db.add_question_to_assignment(conn, aid, q["id"])
+    questions = db.list_questions(conn, status="approved")
+
+    db.add_question_to_assignment(conn, aid, questions[0]["id"])
+    assert [q["aq_point_value"] for q in db.list_assignment_questions(conn, aid)] == [100.0]
+
+    db.add_question_to_assignment(conn, aid, questions[1]["id"])
+    assert [q["aq_point_value"] for q in db.list_assignment_questions(conn, aid)] == [50.0, 50.0]
+
+    db.add_question_to_assignment(conn, aid, questions[2]["id"])
+    points = [
+        q["aq_point_value"] for q in db.list_assignment_questions(conn, aid)
+    ]
+    assert points == [33.34, 33.33, 33.33]
+    assert sum(points) == 100.0
+
+
+def test_bulk_add_preserves_order_and_balances_once(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    questions = db.list_questions(conn, status="approved")
+    ids = [questions[2]["id"], questions[0]["id"], questions[1]["id"]]
+
+    added = db.add_questions_to_assignment(conn, aid, ids + [ids[0]])
+
+    assert added == ids
     picked = db.list_assignment_questions(conn, aid)
-    # every picked question starts at 1 pt regardless of the question's
-    # own default_grade, so equally-weighted assignments are zero-work.
-    assert picked[0]["aq_point_value"] == 1.0
+    assert [q["id"] for q in picked] == ids
+    assert [q["aq_point_value"] for q in picked] == [33.34, 33.33, 33.33]
 
 
 def test_set_assignment_question_points_updates_value(conn_with_approved):
@@ -118,6 +141,35 @@ def test_set_assignment_question_points_updates_value(conn_with_approved):
     db.set_assignment_question_points(conn, aid, q["id"], 2.5)
     picked = db.list_assignment_questions(conn, aid)
     assert picked[0]["aq_point_value"] == 2.5
+    assert db.get_assignment(conn, aid)["points_manually_adjusted"] == 1
+
+
+def test_manual_points_are_not_rebalanced_on_add_or_remove(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    questions = db.list_questions(conn, status="approved")
+    db.add_questions_to_assignment(conn, aid, [q["id"] for q in questions[:2]])
+    db.set_assignment_question_points(conn, aid, questions[0]["id"], 60.0)
+
+    db.add_question_to_assignment(conn, aid, questions[2]["id"])
+    picked = db.list_assignment_questions(conn, aid)
+    assert [q["aq_point_value"] for q in picked] == [60.0, 50.0, 1.0]
+
+    db.remove_question_from_assignment(conn, aid, questions[2]["id"])
+    picked = db.list_assignment_questions(conn, aid)
+    assert [q["aq_point_value"] for q in picked] == [60.0, 50.0]
+
+
+def test_deleting_question_rebalances_automatic_assignment(conn_with_approved):
+    conn = conn_with_approved
+    aid = db.create_assignment(conn, "Q")
+    questions = db.list_questions(conn, status="approved")
+    db.add_questions_to_assignment(conn, aid, [q["id"] for q in questions])
+
+    db.delete_question(conn, questions[1]["id"])
+
+    picked = db.list_assignment_questions(conn, aid)
+    assert [q["aq_point_value"] for q in picked] == [50.0, 50.0]
 
 
 def test_export_uses_overridden_point_value(conn_with_approved):
@@ -127,13 +179,13 @@ def test_export_uses_overridden_point_value(conn_with_approved):
     db.add_question_to_assignment(conn, aid, qs[0]["id"])
     db.add_question_to_assignment(conn, aid, qs[1]["id"])
     db.set_assignment_question_points(conn, aid, qs[0]["id"], 3.0)
-    # leave qs[1]'s point_value at the copied default (1.0)
+    # The second question retains its last automatic value after manual mode starts.
 
     xml = exporter.build_assignment_xml(conn, aid)
     root = etree.fromstring(xml.encode("utf-8"))
     non_cat = [q for q in root.findall("question") if q.get("type") != "category"]
     grades = [float(q.find("defaultgrade").text) for q in non_cat]
-    assert grades == [3.0, 1.0]
+    assert grades == [3.0, 50.0]
 
 
 def test_export_uses_assignment_name_as_sole_category(conn_with_approved):

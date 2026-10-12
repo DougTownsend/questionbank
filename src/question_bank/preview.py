@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import base64
 import html
+import mimetypes
+import re
 import sqlite3
 from typing import Iterable
+from urllib.parse import unquote
+
+from lxml import etree
 
 from .moodle_xml import format_category_for_display
 
@@ -10,6 +16,7 @@ PREVIEW_CSS = """
 .qb-preview { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
               line-height: 1.5; color: #222; }
 .qb-preview .qb-stem { font-size: 1.05rem; margin-bottom: 1rem; }
+.qb-preview img { max-width: 100%; height: auto; }
 .qb-preview .qb-meta { color: #666; font-size: 0.85rem; margin-bottom: 0.75rem; }
 .qb-preview .qb-answer {
     border: 1px solid #ddd; border-radius: 6px;
@@ -45,9 +52,11 @@ def render_question(
 ) -> str:
     answers = list(answers)
     qtype = question["moodle_type"]
+    multiple = qtype == "multichoice" and question["multichoice_single"] == 0
     parts: list[str] = [f'<div class="qb-preview">']
 
-    meta_bits: list[str] = [f"Type: <b>{html.escape(qtype)}</b>"]
+    type_label = "multichoice (select all that apply)" if multiple else qtype
+    meta_bits: list[str] = [f"Type: <b>{html.escape(type_label)}</b>"]
     cat_display = format_category_for_display(question["raw_category"])
     if cat_display:
         meta_bits.append(f"Category: {html.escape(cat_display)}")
@@ -60,7 +69,7 @@ def render_question(
     parts.append(f'<div class="qb-stem">{question["stem_html"] or ""}</div>')
 
     if qtype == "multichoice":
-        parts.append(_render_multichoice(answers))
+        parts.append(_render_multichoice(answers, multiple=multiple))
     elif qtype == "truefalse":
         parts.append(_render_truefalse(answers))
     elif qtype == "numerical":
@@ -77,10 +86,50 @@ def render_question(
         )
 
     parts.append("</div>")
-    return "".join(parts)
+    return _embed_pluginfiles("".join(parts), question["raw_xml"])
 
 
-def _class_for(fraction: float) -> tuple[str, str]:
+_PLUGINFILE_RE = re.compile(
+    r"@@PLUGINFILE@@/(?P<path>[^\"'<>\s?#]+)(?:\?[^\"'<>\s]*)?"
+)
+
+
+def _embed_pluginfiles(rendered_html: str, raw_xml: str) -> str:
+    try:
+        root = etree.fromstring(raw_xml.encode("utf-8"))
+    except (AttributeError, etree.XMLSyntaxError):
+        return rendered_html
+
+    files: dict[str, str] = {}
+    for file_el in root.findall(".//file"):
+        if file_el.get("encoding") != "base64" or not file_el.get("name"):
+            continue
+        payload = "".join((file_el.text or "").split())
+        try:
+            base64.b64decode(payload, validate=True)
+        except ValueError:
+            continue
+        path = "/".join(
+            part
+            for part in (
+                (file_el.get("path") or "/").strip("/"),
+                file_el.get("name") or "",
+            )
+            if part
+        )
+        mime_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        files[path] = f"data:{mime_type};base64,{payload}"
+
+    def replace(match: re.Match[str]) -> str:
+        path = unquote(match.group("path")).strip("/")
+        return files.get(path, match.group(0))
+
+    return _PLUGINFILE_RE.sub(replace, rendered_html)
+
+
+def _class_for(fraction: float, *, multiple: bool = False) -> tuple[str, str]:
+    if multiple and fraction > 0:
+        return "qb-correct", f"Correct selection ({fraction:g}%)"
     if fraction >= 99.999:
         return "qb-correct", "Correct"
     if fraction > 0:
@@ -88,10 +137,13 @@ def _class_for(fraction: float) -> tuple[str, str]:
     return "qb-wrong", "Incorrect"
 
 
-def _render_multichoice(answers: list[sqlite3.Row]) -> str:
-    items: list[str] = ["<div><b>Answer options:</b></div>"]
+def _render_multichoice(
+    answers: list[sqlite3.Row], *, multiple: bool
+) -> str:
+    instruction = "Select all that apply" if multiple else "Answer options"
+    items: list[str] = [f"<div><b>{instruction}:</b></div>"]
     for i, a in enumerate(answers):
-        cls, label = _class_for(a["fraction"])
+        cls, label = _class_for(a["fraction"], multiple=multiple)
         items.append(
             f'<div class="qb-answer {cls}">'
             f'<span class="qb-badge {cls}">{label}</span>'

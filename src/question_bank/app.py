@@ -167,6 +167,16 @@ def class_dashboard(class_name: str) -> None:
             on_click=lambda: ui.navigate.to(f"/class/{class_name}/bank/rejected"),
         ).props("flat").set_enabled(rejected > 0)
 
+    with ui.row().classes("gap-2 mt-4"):
+        ui.button(
+            "LaTeX bank export (no feedback)",
+            on_click=lambda: _export_bank_latex(class_name, include_feedback=False),
+        ).props("color=primary outline").set_enabled(approved > 0)
+        ui.button(
+            "LaTeX bank export (with feedback)",
+            on_click=lambda: _export_bank_latex(class_name, include_feedback=True),
+        ).props("color=primary outline").set_enabled(approved > 0)
+
 
 # ---------- import screen ----------
 
@@ -780,6 +790,11 @@ def edit_question_page(
         "stem_html": q["stem_html"] or "",
         "raw_category": q["raw_category"] or "",
         "general_feedback_html": q["general_feedback_html"] or "",
+        "multichoice_single": (
+            bool(q["multichoice_single"])
+            if qtype == "multichoice"
+            else None
+        ),
         "answers": [
             {
                 "text_html": a["text_html"] or "",
@@ -814,6 +829,14 @@ def edit_question_page(
             .classes("w-full")
             .props("rows=3 autogrow")
         )
+        multiple_input = (
+            ui.checkbox(
+                "Select all that apply (allow multiple answers)",
+                value=not state["multichoice_single"],
+            )
+            if qtype == "multichoice"
+            else None
+        )
 
         ui.separator().classes("my-2")
         ui.label("Answers").classes("text-lg font-semibold")
@@ -826,6 +849,8 @@ def edit_question_page(
             state["stem_html"] = stem_input.value or ""
             state["raw_category"] = cat_input.value or ""
             state["general_feedback_html"] = gf_input.value or ""
+            if multiple_input is not None:
+                state["multichoice_single"] = not bool(multiple_input.value)
             for i, row in enumerate(answer_rows):
                 if i >= len(state["answers"]):
                     continue
@@ -854,7 +879,7 @@ def edit_question_page(
                         with ui.row().classes("w-full items-end gap-2"):
                             row["fraction"] = (
                                 ui.number(
-                                    label="Score % (100=correct, 0=wrong)",
+                                    label="Score / credit %",
                                     value=a["fraction"],
                                     step=1,
                                 )
@@ -921,6 +946,19 @@ def edit_question_page(
             if not state["answers"]:
                 ui.notify("At least one answer is required", type="negative")
                 return
+            if qtype == "multichoice" and not state["multichoice_single"]:
+                positive_total = sum(
+                    answer["fraction"]
+                    for answer in state["answers"]
+                    if answer["fraction"] > 0
+                )
+                if abs(positive_total - 100.0) > 0.001:
+                    ui.notify(
+                        "For select-all questions, positive answer credits "
+                        f"must total 100% (currently {positive_total:g}%)",
+                        type="negative",
+                    )
+                    return
 
             raw_xml = moodle_xml.serialize_question(
                 moodle_type=qtype,
@@ -930,6 +968,7 @@ def edit_question_page(
                 default_grade=q["default_grade"],
                 penalty=q["penalty"],
                 answers=state["answers"],
+                multichoice_single=bool(state["multichoice_single"]),
             )
             stem_hash = moodle_xml.stem_hash_for(state["stem_html"])
             with open_db(class_name) as conn:
@@ -943,6 +982,7 @@ def edit_question_page(
                     raw_category=state["raw_category"] or None,
                     general_feedback_html=state["general_feedback_html"] or None,
                     answers=state["answers"],
+                    multichoice_single=state["multichoice_single"],
                 )
             ui.notify("Saved", type="positive")
             ui.navigate.to(back_url)
@@ -1076,34 +1116,74 @@ def assignment_detail_page(class_name: str, assignment_id: str) -> None:
 def _render_selected(container: ui.column, class_name: str, aid: int) -> None:
     container.clear()
     with open_db(class_name) as conn:
+        assignment = db.get_assignment(conn, aid)
         picked = db.list_assignment_questions(conn, aid)
+        # pre-render previews while the connection is open
+        rendered_previews = {
+            q["id"]: preview.render_question(q, db.get_answers(conn, q["id"]))
+            for q in picked
+        }
+
+    expansions: list = []
+
+    def expand_all() -> None:
+        for e in expansions:
+            e.set_value(True)
+
+    def collapse_all() -> None:
+        for e in expansions:
+            e.set_value(False)
 
     with container:
         with ui.row().classes("w-full items-center justify-between"):
-            ui.label(f"In this assignment ({len(picked)})").classes(
-                "text-lg font-semibold"
-            )
+            with ui.column().classes("gap-0"):
+                ui.label(f"In this assignment ({len(picked)})").classes(
+                    "text-lg font-semibold"
+                )
+                total_points = sum(q["aq_point_value"] or 0 for q in picked)
+                automatic = bool(
+                    assignment is not None
+                    and not assignment["points_manually_adjusted"]
+                )
+                point_mode = "auto-balanced" if automatic else "manual"
+                points_status = ui.label(
+                    f"{total_points:g} points total · {point_mode}"
+                ).classes("text-sm text-gray-500")
             with ui.row().classes("gap-2 flex-wrap"):
                 ui.button(
                     "Export Moodle XML",
                     on_click=lambda: _export_assignment(class_name, aid),
                 ).props("color=primary").set_enabled(len(picked) > 0)
                 ui.button(
-                    "LaTeX (student)",
+                    "LaTeX (questions only)",
                     on_click=lambda: _export_assignment_latex(
-                        class_name, aid, include_answer_key=False
+                        class_name, aid, mode="student"
                     ),
                 ).props("color=primary outline").set_enabled(len(picked) > 0)
                 ui.button(
-                    "LaTeX (with answer key)",
+                    "LaTeX (detailed key)",
                     on_click=lambda: _export_assignment_latex(
-                        class_name, aid, include_answer_key=True
+                        class_name, aid, mode="key"
+                    ),
+                ).props("color=primary outline").set_enabled(len(picked) > 0)
+                ui.button(
+                    "LaTeX (answers only)",
+                    on_click=lambda: _export_assignment_latex(
+                        class_name, aid, mode="answers_only"
                     ),
                 ).props("color=primary outline").set_enabled(len(picked) > 0)
                 ui.button(
                     "Delete assignment",
                     on_click=lambda: _confirm_delete_assignment(class_name, aid),
                 ).props("color=negative flat")
+
+        with ui.row().classes("gap-2 items-center mt-1"):
+            ui.button("Expand all", on_click=expand_all).props(
+                "flat dense"
+            ).set_enabled(len(picked) > 0)
+            ui.button("Collapse all", on_click=collapse_all).props(
+                "flat dense"
+            ).set_enabled(len(picked) > 0)
 
         if not picked:
             ui.label("No questions yet. Add from the right →").classes(
@@ -1112,34 +1192,32 @@ def _render_selected(container: ui.column, class_name: str, aid: int) -> None:
             return
 
         for i, q in enumerate(picked):
-            with ui.card().classes("w-full"):
-                with ui.row().classes(
-                    "w-full items-center no-wrap gap-2"
-                ):
-                    with ui.column().classes("gap-0 flex-grow"):
-                        ui.label(
-                            f"{i + 1}. [{q['moodle_type']}] {q['name'] or '(unnamed)'}"
-                        ).classes("font-semibold")
-                        cat_display = format_category_for_display(q["raw_category"])
-                        if cat_display:
-                            ui.label(cat_display).classes(
-                                "text-xs text-gray-500 font-mono"
-                            )
-                    ui.number(
-                        label="Pts",
-                        value=q["aq_point_value"],
-                        step=0.5,
-                        min=0,
-                        on_change=lambda e, qid=q["id"]: _save_points(
-                            class_name, aid, qid, e.value
-                        ),
-                    ).classes("w-24").props("dense")
-                    ui.button(
-                        "Remove",
-                        on_click=lambda _, qid=q["id"]: _remove_from_assignment(
-                            class_name, aid, qid
-                        ),
-                    ).props("color=negative flat dense")
+            cat_display = format_category_for_display(q["raw_category"])
+            header = (
+                f"{i + 1}. [{q['moodle_type']}] {q['name'] or '(unnamed)'}"
+            )
+            with ui.row().classes("w-full items-start no-wrap gap-2"):
+                ui.number(
+                    label="Pts",
+                    value=q["aq_point_value"],
+                    step=0.01,
+                    min=0,
+                    on_change=lambda e, qid=q["id"]: _save_points_and_mark_manual(
+                        class_name, aid, qid, e.value, points_status
+                    ),
+                ).classes("w-24 mt-2").props("dense")
+                ui.button(
+                    "Remove",
+                    on_click=lambda _, qid=q["id"]: _remove_from_assignment(
+                        class_name, aid, qid
+                    ),
+                ).props("color=negative flat dense").classes("mt-2")
+                exp = ui.expansion(header, caption=cat_display or None).classes(
+                    "flex-grow"
+                ).props("header-class=bg-gray-50")
+                with exp:
+                    ui.html(rendered_previews[q["id"]])
+                expansions.append(exp)
 
 
 def _render_pool(
@@ -1155,6 +1233,10 @@ def _render_pool(
     with open_db(class_name) as conn:
         approved = db.list_questions(conn, status="approved")
         picked_ids = set(db.assignment_question_ids(conn, aid))
+        rendered_previews = {
+            q["id"]: preview.render_question(q, db.get_answers(conn, q["id"]))
+            for q in approved
+        }
 
     all_cats = sorted(
         {format_category_for_display(q["raw_category"]) for q in approved}
@@ -1186,6 +1268,40 @@ def _render_pool(
         return True
 
     available = [q for q in approved if matches(q)]
+
+    expansions: list = []
+    selection: dict[int, "ui.checkbox"] = {}
+
+    def selected_ids() -> list[int]:
+        return [qid for qid, checkbox in selection.items() if checkbox.value]
+
+    def refresh_add_toolbar() -> None:
+        count = len(selected_ids())
+        add_selected_btn.text = f"Add selected ({count})"
+        add_selected_btn.set_enabled(count > 0)
+
+    def select_all() -> None:
+        for checkbox in selection.values():
+            checkbox.value = True
+        refresh_add_toolbar()
+
+    def clear_selection() -> None:
+        for checkbox in selection.values():
+            checkbox.value = False
+        refresh_add_toolbar()
+
+    def add_selected() -> None:
+        question_ids = selected_ids()
+        if question_ids:
+            _add_many_to_assignment(class_name, aid, question_ids)
+
+    def expand_all() -> None:
+        for e in expansions:
+            e.set_value(True)
+
+    def collapse_all() -> None:
+        for e in expansions:
+            e.set_value(False)
 
     with container:
         ui.label(f"Approved bank ({len(available)} available)").classes(
@@ -1227,6 +1343,20 @@ def _render_pool(
 
         text_in.on("update:model-value", on_text)
 
+        with ui.row().classes("gap-2 items-center mt-1 flex-wrap"):
+            add_selected_btn = ui.button(
+                "Add selected (0)", on_click=add_selected
+            ).props("color=primary")
+            add_selected_btn.set_enabled(False)
+            ui.button("Select all", on_click=select_all).props("flat dense")
+            ui.button("Clear", on_click=clear_selection).props("flat dense")
+            ui.button("Expand all", on_click=expand_all).props(
+                "flat dense"
+            ).set_enabled(len(available) > 0)
+            ui.button("Collapse all", on_click=collapse_all).props(
+                "flat dense"
+            ).set_enabled(len(available) > 0)
+
         if not available:
             ui.label("Nothing matches (or everything is already added).").classes(
                 "text-gray-500 italic mt-2"
@@ -1234,35 +1364,30 @@ def _render_pool(
             return
 
         for q in available:
-            with ui.card().classes("w-full"):
-                with ui.row().classes("w-full items-center no-wrap gap-3"):
-                    ui.button(
-                        "Add",
-                        on_click=lambda _, qid=q["id"]: _add_to_assignment(
-                            class_name, aid, qid
-                        ),
-                    ).props("color=primary")
-                    with ui.column().classes("gap-0 flex-grow"):
-                        ui.label(
-                            f"[{q['moodle_type']}] {q['name'] or '(unnamed)'}"
-                        ).classes("font-semibold")
-                        cat_display = format_category_for_display(q["raw_category"])
-                        if cat_display:
-                            ui.label(cat_display).classes(
-                                "text-xs text-gray-500 font-mono"
-                            )
-                        ui.html(
-                            f"<div style='font-size:0.8rem;color:#555;max-height:3em;overflow:hidden'>{q['stem_html'] or ''}</div>"
-                        )
+            cat_display = format_category_for_display(q["raw_category"])
+            header = f"[{q['moodle_type']}] {q['name'] or '(unnamed)'}"
+            with ui.row().classes("w-full items-start no-wrap gap-2"):
+                checkbox = ui.checkbox(
+                    on_change=lambda _: refresh_add_toolbar()
+                ).classes("mt-2")
+                selection[q["id"]] = checkbox
+                exp = ui.expansion(header, caption=cat_display or None).classes(
+                    "flex-grow"
+                ).props("header-class=bg-gray-50")
+                with exp:
+                    ui.html(rendered_previews[q["id"]])
+                expansions.append(exp)
 
 
-def _add_to_assignment(class_name: str, aid: int, qid: int) -> None:
+def _add_many_to_assignment(
+    class_name: str, aid: int, question_ids: list[int]
+) -> None:
     with open_db(class_name) as conn:
-        added = db.add_question_to_assignment(conn, aid, qid)
+        added = db.add_questions_to_assignment(conn, aid, question_ids)
     if added:
-        ui.notify("Added", type="positive")
+        ui.notify(f"Added {len(added)} question(s)", type="positive")
     else:
-        ui.notify("Already in this assignment", type="warning")
+        ui.notify("No questions were added", type="warning")
     ui.navigate.reload()
 
 
@@ -1273,14 +1398,22 @@ def _remove_from_assignment(class_name: str, aid: int, qid: int) -> None:
     ui.navigate.reload()
 
 
-def _save_points(class_name: str, aid: int, qid: int, raw_value) -> None:
+def _save_points(class_name: str, aid: int, qid: int, raw_value) -> bool:
     try:
         points = None if raw_value in (None, "") else float(raw_value)
     except (TypeError, ValueError):
         ui.notify("Points must be a number", type="warning")
-        return
+        return False
     with open_db(class_name) as conn:
         db.set_assignment_question_points(conn, aid, qid, points)
+    return True
+
+
+def _save_points_and_mark_manual(
+    class_name: str, aid: int, qid: int, raw_value, status_label
+) -> None:
+    if _save_points(class_name, aid, qid, raw_value):
+        status_label.text = "Automatic balancing off · manual point values"
 
 
 def _export_assignment(class_name: str, aid: int) -> None:
@@ -1289,15 +1422,31 @@ def _export_assignment(class_name: str, aid: int) -> None:
     ui.notify(f"Exported: {path}", type="positive", timeout=10000)
 
 
-def _export_assignment_latex(
-    class_name: str, aid: int, *, include_answer_key: bool
-) -> None:
+_LATEX_MODE_LABELS = {
+    "student": "questions only",
+    "key": "detailed key",
+    "answers_only": "answers only",
+}
+
+
+def _export_assignment_latex(class_name: str, aid: int, *, mode: str) -> None:
     with open_db(class_name) as conn:
         path = latex_exporter.export_assignment_to_latex_file(
-            conn, class_name, aid, include_answer_key=include_answer_key
+            conn, class_name, aid, mode=mode
         )
-    kind = "with answer key" if include_answer_key else "student copy"
-    ui.notify(f"Exported LaTeX ({kind}): {path}", type="positive", timeout=10000)
+    label = _LATEX_MODE_LABELS.get(mode, mode)
+    ui.notify(f"Exported LaTeX ({label}): {path}", type="positive", timeout=10000)
+
+
+def _export_bank_latex(class_name: str, *, include_feedback: bool) -> None:
+    with open_db(class_name) as conn:
+        path = latex_exporter.export_bank_to_latex_file(
+            conn, class_name, include_feedback=include_feedback
+        )
+    kind = "with feedback" if include_feedback else "no feedback"
+    ui.notify(
+        f"Exported bank LaTeX ({kind}): {path}", type="positive", timeout=10000
+    )
 
 
 def _confirm_delete_assignment(class_name: str, aid: int) -> None:

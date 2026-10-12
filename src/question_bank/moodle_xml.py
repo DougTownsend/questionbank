@@ -22,6 +22,7 @@ class ParsedAnswer:
 @dataclass
 class ParsedQuestion:
     moodle_type: str
+    multichoice_single: bool | None
     name: str | None
     stem_html: str
     raw_xml: str
@@ -89,6 +90,9 @@ def _parse_question(
     general_feedback_html = _text(q.find("generalfeedback/text"))
     default_grade = _float(q.find("defaultgrade"))
     penalty = _float(q.find("penalty"))
+    multichoice_single = (
+        _bool(q.find("single"), default=True) if qtype == "multichoice" else None
+    )
 
     answers: list[ParsedAnswer] = []
     for a in q.findall("answer"):
@@ -105,10 +109,19 @@ def _parse_question(
             )
         )
 
+    if qtype == "multichoice" and not multichoice_single:
+        positive_total = sum(a.fraction for a in answers if a.fraction > 0)
+        if abs(positive_total - 100.0) > 0.001:
+            raise ParseError(
+                "multi-answer multichoice fractions greater than zero "
+                f"must total 100, got {positive_total:g}"
+            )
+
     raw_xml = etree.tostring(q, encoding="unicode")
 
     return ParsedQuestion(
         moodle_type=qtype,
+        multichoice_single=multichoice_single,
         name=name,
         stem_html=stem_html,
         raw_xml=raw_xml,
@@ -123,6 +136,15 @@ def _parse_question(
 def _text(el: etree._Element | None) -> str | None:
     if el is None:
         return None
+    # Claude sometimes writes <text><code>x</code></text> instead of wrapping
+    # the HTML in CDATA. lxml then parses <code> as a real child element and
+    # .text only holds the string BEFORE the first child, silently truncating
+    # the answer. Serialize mixed content back into a single string.
+    if len(el) > 0:
+        parts: list[str] = [el.text or ""]
+        for child in el:
+            parts.append(etree.tostring(child, encoding="unicode"))
+        return "".join(parts)
     return el.text
 
 
@@ -133,6 +155,12 @@ def _float(el: etree._Element | None) -> float | None:
         return float(el.text)
     except ValueError:
         return None
+
+
+def _bool(el: etree._Element | None, *, default: bool) -> bool:
+    if el is None or el.text is None:
+        return default
+    return el.text.strip().lower() not in {"false", "0", "no"}
 
 
 # ---------- stem hashing (for dedup) ----------
@@ -190,6 +218,7 @@ def serialize_question(
     default_grade: float | None,
     penalty: float | None,
     answers: list[dict],
+    multichoice_single: bool = True,
 ) -> str:
     """Build a `<question>` element fragment for the given fields.
     Used to refresh `raw_xml` after an in-app edit, so later exports reflect
@@ -212,7 +241,9 @@ def serialize_question(
     etree.SubElement(q, "hidden").text = "0"
 
     if moodle_type == "multichoice":
-        etree.SubElement(q, "single").text = "true"
+        etree.SubElement(q, "single").text = (
+            "true" if multichoice_single else "false"
+        )
         etree.SubElement(q, "shuffleanswers").text = "true"
         etree.SubElement(q, "answernumbering").text = "abc"
 

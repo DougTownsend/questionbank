@@ -61,6 +61,7 @@ def _apply_import(
                 penalty=q.penalty,
                 general_feedback_html=q.general_feedback_html,
                 source_import_id=import_id,
+                multichoice_single=q.multichoice_single,
                 answers=[
                     {
                         "text_html": a.text_html,

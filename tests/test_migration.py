@@ -97,16 +97,20 @@ def test_migration_from_v1_adds_point_value_column(tmp_path):
     assert "point_value" in cols_after
 
     version = conn.execute("SELECT version FROM schema_info").fetchone()["version"]
-    assert version == 3
+    assert version == 5
+    question_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(questions)")
+    }
+    assert "multichoice_single" in question_cols
 
-    # pre-existing assignment rows had no point_value; the v2→v3 migration
-    # backfills them to 1.0 so the default-equal-weight UX just works.
+    # The untouched assignment migrates into automatic 100-point mode.
     existing = conn.execute(
         "SELECT point_value FROM assignment_questions WHERE question_id = 1"
     ).fetchone()
-    assert existing["point_value"] == 1.0
+    assert existing["point_value"] == 100.0
+    assert db.get_assignment(conn, 1)["points_manually_adjusted"] == 0
 
-    # new adds also default to 1.0 regardless of the question's default_grade
+    # New additions rebalance the untouched assignment.
     qid = db.insert_question(
         conn,
         moodle_type="truefalse",
@@ -124,5 +128,40 @@ def test_migration_from_v1_adds_point_value_column(tmp_path):
     db.set_status(conn, qid, "approved")
     assert db.add_question_to_assignment(conn, 1, qid) is True
     picked = db.list_assignment_questions(conn, 1)
-    by_qid = {p["id"]: p for p in picked}
-    assert by_qid[qid]["aq_point_value"] == 1.0
+    assert [p["aq_point_value"] for p in picked] == [50.0, 50.0]
+
+
+def test_migration_from_v4_recovers_select_all_flag(tmp_path):
+    db_path = tmp_path / "bank.sqlite"
+    conn = db.connect(db_path)
+    qid = db.insert_question(
+        conn,
+        moodle_type="multichoice",
+        multichoice_single=False,
+        name="Select all",
+        stem_html="Select all that apply.",
+        stem_hash="select-all",
+        raw_xml=(
+            '<question type="multichoice"><single>false</single></question>'
+        ),
+        raw_category=None,
+        default_grade=1.0,
+        penalty=0.3333333,
+        general_feedback_html=None,
+        source_import_id=None,
+        answers=[
+            {"text_html": "A", "fraction": 50.0, "feedback_html": None},
+            {"text_html": "B", "fraction": 50.0, "feedback_html": None},
+        ],
+    )
+    conn.close()
+
+    raw_conn = sqlite3.connect(db_path, isolation_level=None)
+    raw_conn.execute("ALTER TABLE questions DROP COLUMN multichoice_single")
+    raw_conn.execute("UPDATE schema_info SET version = 4")
+    raw_conn.close()
+
+    migrated = db.connect(db_path)
+
+    assert db.get_question(migrated, qid)["multichoice_single"] == 0
+    assert migrated.execute("SELECT version FROM schema_info").fetchone()["version"] == 5

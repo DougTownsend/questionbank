@@ -51,6 +51,7 @@ def test_import_creates_assignment_and_deletes_source_file(env):
 
     picked = db.list_assignment_questions(env["conn"], report.assignment_id)
     assert [p["id"] for p in picked] == env["approved"]
+    assert [p["aq_point_value"] for p in picked] == [50.0, 50.0]
 
 
 def test_preserves_order(env):
